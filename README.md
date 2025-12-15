@@ -10,9 +10,6 @@ This project analyzes NYC 311 service request patterns to identify geographic di
 
 ---
 
-<p align="center">
-  <img src="https://www.nyc.gov/assets/home/images/press_release/2019/311-logo.png" alt="NYC 311" width="200"/>
-</p>
 
 ## 📋 Table of Contents
 
