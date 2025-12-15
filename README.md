@@ -409,11 +409,7 @@ U.S. Census Bureau. (2022). *American Community Survey 5-year estimates*. https:
 📅 Date: December 2025  
 📊 Course: DATA 607 - Data Acquisition and Management
 
----
-
-<p align="center">
-  <img src="https://sps.cuny.edu/sites/default/files/2021-02/sps-logo-blue.png" alt="CUNY SPS" width="200"/>
-</p>
+--
 
 <p align="center">
   <i>This project was completed as part of the Master of Science in Data Science program at CUNY School of Professional Studies.</i>
