@@ -1,0 +1,639 @@
+---
+title: "Final Project 607"
+author: "Candace Grant"
+date: "2025-11-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Proposal with data sources using the OSEM workflow
+
+As a NYC resident and Data Science graduate student, I'm analyzing 311 service request data from 2010 to present to understand complaint patterns across our five boroughs. The 311 system is how we report non-emergency issues—from potholes and noise complaints to heat outages and street light repairs. By visualizing this data geographically, we can see where problems occur and how they cluster in specific neighborhoods.
+
+**How NYC Currently Uses 311 Data**
+
+Reactive Response:
+
+* City agencies respond to individual complaints as they come in
+* Departments track response times and closure rates
+* Data helps allocate inspectors and service crews to specific addresses
+
+Performance Monitoring:
+
+* Agencies measure how quickly they resolve different complaint types
+* City leadership tracks which neighborhoods generate the most requests
+* Budget decisions are informed by service demand patterns
+
+**Technical Approach**
+
+This project analyzes **NYC 311 service request data** to identify geographic complaint patterns and enable proactive municipal management. I will pull the data directly from the NYC Open Data Socrata API using the RSocrata package in R and download NYC geographic boundary files (boroughs, ZIP codes, community districts) using the tigris package for spatial mapping.
+
+The data cleaning process will use dplyr, tidyr, and lubridate to remove records with missing coordinates, standardize complaint categories, convert dates to proper datetime format, and create time-based variables like year, month, and season for trend analysis.
+
+For visualization and analysis, I will create time series plots showing complaint trends over the years using ggplot2 and plotly, interactive maps displaying complaint density by neighborhood with leaflet and sf, heat maps revealing geographic hotspots, and comparison charts showing how complaint types differ across boroughs. 
+
+My deliverable will be an interactive Shiny dashboard that allows users to filter by complaint type, date range, and borough. The dashboard will feature linked visualizations—an interactive map with complaint markers, dynamic time series charts, and summary statistics—where selections on one view automatically update the others. Users can explore patterns, download custom reports, and identify areas needing proactive intervention.
+
+
+### Data sources
+
+```{r}
+# Load required packages
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(tibble)
+
+
+# Load API token from environment variable (stored in .Renviron)
+app_token <- Sys.getenv("NYC_OPENDATA_TOKEN")
+
+# Check if token loaded successfully
+if (app_token == "") {
+  stop("API token not found. Please set NYC_OPENDATA_TOKEN in your .Renviron file.")
+}
+
+# Use the SODA API endpoint
+api_url <- "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
+
+query_params <- list(
+  `$limit` = 80000,
+  `$order` = "created_date DESC",
+  `$$app_token` = app_token
+)
+
+response <- GET(api_url, query = query_params)
+
+if (status_code(response) == 200) {
+  df_311 <- content(response, as = "text", encoding = "UTF-8") %>%
+    fromJSON(flatten = TRUE) %>%
+    as.data.frame()
+  
+  print(head(df_311))
+} else {
+  print(paste("Error:", status_code(response)))
+}
+
+nrow(df_311)
+sum(is.na(df_311$hour))
+
+```
+
+## Data transformation on create date column
+
+```{r}
+df_311 <- df_311 %>%
+  mutate(
+    created_date = as.POSIXct(created_date, format = "%Y-%m-%dT%H:%M:%S"),
+    closed_date = as.POSIXct(closed_date, format = "%Y-%m-%dT%H:%M:%S"),
+    date_only = as.Date(created_date),
+    hour = hour(created_date),
+    day_of_week = wday(created_date, label = TRUE),
+    month = month(created_date, label = TRUE)
+  )
+print(str(df_311))
+sum(is.na(df_311$hour))
+df_311 %>% count(day_of_week)
+```
+## Weather Data Integration to Correlate Service Requests with Weather
+
+```{r}
+
+# WEATHER DATA INTEGRATION
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(lubridate)
+
+# Get date range from your 311 data
+start_date <- min(df_311$date_only, na.rm = TRUE)
+end_date <- max(df_311$date_only, na.rm = TRUE)
+
+# Fetch NYC historical weather
+weather_url <- "https://archive-api.open-meteo.com/v1/archive"
+
+weather_params <- list(
+  latitude = 40.7128,
+  longitude = -74.0060,
+  start_date = as.character(start_date),
+  end_date = as.character(end_date),
+  daily = "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,windspeed_10m_max",
+  timezone = "America/New_York"
+)
+
+weather_response <- GET(weather_url, query = weather_params)
+
+if (status_code(weather_response) == 200) {
+  weather_json <- fromJSON(content(weather_response, "text", encoding = "UTF-8"))
+  
+  weather_df <- data.frame(
+    date = as.Date(weather_json$daily$time),
+    temp_max_f = weather_json$daily$temperature_2m_max * 9/5 + 32,  # Convert to Fahrenheit
+    temp_min_f = weather_json$daily$temperature_2m_min * 9/5 + 32,
+    temp_mean_f = weather_json$daily$temperature_2m_mean * 9/5 + 32,
+    precipitation_mm = weather_json$daily$precipitation_sum,
+    wind_max_mph = weather_json$daily$windspeed_10m_max * 0.621371  # Convert to mph
+  )
+  
+  cat("Weather data retrieved:", nrow(weather_df), "days\n")
+  print(head(weather_df))
+} else {
+  cat("Error fetching weather:", status_code(weather_response), "\n")
+}
+
+# Join weather to 311 data
+df_311 <- df_311 %>%
+  left_join(weather_df, by = c("date_only" = "date"))
+
+# Verify join
+cat("\nWeather columns added:", sum(!is.na(df_311$temp_mean_f)), "rows with weather data\n")
+
+```
+## Adding demographic data to investigate the correlation with 311 Service Requests
+
+```{r}
+library(tidycensus)
+library(dplyr)
+
+# Load the key from environment variable
+census_api_key(Sys.getenv("CENSUS_API_KEY"))
+query_params <- list(
+  `$limit` = 75000,  # More records = more days
+  `$order` = "created_date DESC"
+)
+
+# Fetch NYC demographic data by borough
+nyc_demographics <- get_acs(
+  geography = "county",
+  state = "NY",
+  county = c("005", "047", "061", "081", "085"),
+  variables = c(
+    total_pop = "B01003_001",
+    median_income = "B19013_001",
+    median_age = "B01002_001",
+    total_housing = "B25001_001",
+    renter_occupied = "B25003_003",
+    poverty_count = "B17001_002"
+  ),
+  year = 2022,
+  output = "wide"
+)
+
+# Clean up borough names to match your 311 data
+nyc_demographics <- nyc_demographics %>%
+  mutate(
+    borough = case_when(
+      grepl("Bronx", NAME) ~ "BRONX",
+      grepl("Kings", NAME) ~ "BROOKLYN",
+      grepl("New York County", NAME) ~ "MANHATTAN",
+      grepl("Queens", NAME) ~ "QUEENS",
+      grepl("Richmond", NAME) ~ "STATEN ISLAND"
+    ),
+    pct_renter = renter_occupiedE / total_housingE * 100,
+    pct_poverty = poverty_countE / total_popE * 100
+  ) %>%
+  select(borough, 
+         population = total_popE, 
+         median_income = median_incomeE, 
+         median_age = median_ageE,
+         pct_renter,
+         pct_poverty)
+
+print("NYC Demographics by Borough:")
+print(nyc_demographics)
+
+# Join demographics to 311 data
+df_311 <- df_311 %>%
+  left_join(nyc_demographics, by = "borough")
+
+cat("Demographics joined:", sum(!is.na(df_311$population)), "rows with demographic data\n")
+head(df_311, 5)
+```
+
+
+
+
+## Scrub the data
+## Missing values- % by column know if to impute or drop, % of NA
+
+
+## Data Visualizations and Statistical Analysis
+
+```{r}
+library(ggplot2)
+
+#DATA. VISUALIZATIONS
+
+# Top Complaint Types
+df_311 %>%
+  count(complaint_type, sort = TRUE) %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(complaint_type, n), y = n, fill = complaint_type)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 Complaint Types in NYC 311 Data",
+    x = "Complaint Type",
+    y = "Number of Complaints"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Complaints by Borough
+
+df_311 %>%
+  filter(!is.na(borough) & borough != "Unspecified") %>%
+  count(borough) %>%
+  ggplot(aes(x = reorder(borough, n), y = n, fill = borough)) +
+  geom_col() +
+  labs(
+    title = "311 Complaints by Borough",
+    x = "Borough",
+    y = "Number of Complaints"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# Complaints by Hour of Day
+
+df_311 %>%
+  count(hour) %>%
+  ggplot(aes(x = hour, y = n)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  labs(
+    title = "311 Complaints by Hour of Day",
+    x = "Hour (24-hour format)",
+    y = "Number of Complaints"
+  ) +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  theme_minimal()
+
+
+# Complaints by Day of Week
+
+df_311 %>%
+  count(day_of_week) %>%
+  ggplot(aes(x = day_of_week, y = n, fill = day_of_week)) +
+  geom_col() +
+  labs(
+    title = "311 Complaints by Day of Week",
+    x = "Day",
+    y = "Number of Complaints"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# Heatmap - Hour vs Day of Week
+
+df_311 %>%
+  count(day_of_week, hour) %>%
+  ggplot(aes(x = hour, y = day_of_week, fill = n)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(
+    title = "Complaint Frequency: Hour vs Day of Week",
+    x = "Hour of Day",
+    y = "Day of Week",
+    fill = "Count"
+  ) +
+  theme_minimal()
+
+
+# Top Complaints by Borough
+
+df_311 %>%
+  filter(!is.na(borough) & borough != "Unspecified") %>%
+  count(borough, complaint_type) %>%
+  group_by(borough) %>%
+  slice_max(n, n = 5) %>%
+  ggplot(aes(x = reorder(complaint_type, n), y = n, fill = borough)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~borough, scales = "free_y") +
+  labs(
+    title = "Top 5 Complaint Types by Borough",
+    x = "Complaint Type",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# STATISTICAL ANALYSIS
+
+# Chi-Square Test: Are complaint types independent of borough?
+contingency_table <- table(df_311$borough, df_311$complaint_type)
+chi_test <- chisq.test(contingency_table)
+print("Chi-Square Test: Complaint Type vs Borough")
+print(chi_test)
+
+# ANOVA: Does response time differ by borough?
+df_311 <- df_311 %>%
+  mutate(response_time = as.numeric(difftime(closed_date, created_date, units = "hours")))
+
+# Remove NA and extreme outliers
+df_response <- df_311 %>%
+  filter(!is.na(response_time) & response_time > 0 & response_time < 720)
+
+anova_result <- aov(response_time ~ borough, data = df_response)
+print("ANOVA: Response Time by Borough")
+print(summary(anova_result))
+
+# Post-hoc test if significant
+tukey_result <- TukeyHSD(anova_result)
+print(tukey_result)
+
+
+# Response Time by Borough
+
+df_response %>%
+  filter(!is.na(borough) & borough != "Unspecified") %>%
+  ggplot(aes(x = borough, y = response_time, fill = borough)) +
+  geom_boxplot() +
+  labs(
+    title = "Response Time (Hours) by Borough",
+    x = "Borough",
+    y = "Response Time (Hours)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# SUMMARY STATISTICS TABLE
+summary_stats <- df_response %>%
+  filter(!is.na(borough) & borough != "Unspecified") %>%
+  group_by(borough) %>%
+  summarise(
+    count = n(),
+    mean_response = mean(response_time, na.rm = TRUE),
+    median_response = median(response_time, na.rm = TRUE),
+    sd_response = sd(response_time, na.rm = TRUE)
+  )
+
+print("Summary Statistics by Borough:")
+print(summary_stats)
+```
+## Highlighting the feature that was not covered in class: Shiny app and dashboard
+
+https://candacegrant2025.shinyapps.io/NYC_311_Requests/
+
+
+## Heating Complaints REsponse Time vs Tempaerature
+
+```{r}
+# Filter heating complaints data
+heating_individual <- df_311 %>%
+  filter(complaint_type == "HEAT/HOT WATER" & !is.na(temp_mean_f)) %>%
+  filter(!is.na(response_time) & response_time > 0 & response_time < 720)
+
+# Plot 1: Heating Complaints COUNT vs Temperature
+heating_count <- df_311 %>%
+  filter(complaint_type == "HEAT/HOT WATER" & !is.na(temp_mean_f)) %>%
+  group_by(date_only, temp_mean_f) %>%
+  summarise(complaints = n(), .groups = "drop")
+
+p1 <- ggplot(heating_count, aes(x = temp_mean_f, y = complaints)) +
+  geom_point(alpha = 0.5, color = "green") +
+  labs(
+    title = "Heating Complaint Volume vs Temperature",
+    x = "Mean Daily Temperature (°F)",
+    y = "Number of Complaints"
+  ) +
+  theme_minimal()
+print
+
+```
+
+## Noise complaints vs Temperature
+
+```{r}
+# Noise complaints - do they increase in warm weather?
+noise_temp <- df_311 %>%
+  filter(grepl("Noise", complaint_type, ignore.case = TRUE)) %>%
+  group_by(date_only, temp_mean_f) %>%
+  summarise(complaints = n(), .groups = "drop")
+
+ggplot(noise_temp, aes(x = temp_mean_f, y = complaints)) +
+  geom_point(alpha = 0.5, color = "orange") +
+  geom_smooth(method = "loess", color = "purple", se = FALSE) +
+  labs(
+    title = "Do Noise Complaints Rise in Warmer Weather?",
+    x = "Mean Daily Temperature (°F)",
+    y = "Number of Noise Complaints"
+  ) +
+  theme_minimal()
+
+cor.test(noise_temp$temp_mean_f, noise_temp$complaints)
+
+```
+
+## Heatmap: Complaint Types vs Tempaerature Ranges
+
+
+```{r}
+# Create temperature bins
+temp_complaints <- df_311 %>%
+  filter(!is.na(temp_mean_f)) %>%
+  mutate(temp_range = cut(temp_mean_f, 
+                          breaks = c(0, 32, 50, 70, 85, 100),
+                          labels = c("Freezing (<32°F)", "Cold (32-50°F)", 
+                                     "Mild (50-70°F)", "Warm (70-85°F)", "Hot (>85°F)"))) %>%
+  filter(complaint_type %in% names(sort(table(df_311$complaint_type), decreasing = TRUE)[1:10])) %>%
+  count(complaint_type, temp_range)
+
+ggplot(temp_complaints, aes(x = temp_range, y = complaint_type, fill = n)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(
+    title = "Complaint Types by Temperature Range",
+    x = "Temperature Range",
+    y = "Complaint Type",
+    fill = "Count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Complaints per capita vs Median Income
+
+```{r}
+# Complaints per capita by borough
+complaints_per_capita <- df_311 %>%
+  filter(!is.na(borough) & borough != "Unspecified") %>%
+  group_by(borough, population, median_income, pct_renter, pct_poverty) %>%
+  summarise(total_complaints = n(), .groups = "drop") %>%
+  mutate(complaints_per_1000 = total_complaints / population * 1000)
+
+ggplot(complaints_per_capita, aes(x = median_income, y = complaints_per_1000)) +
+  geom_point(size = 5, color = "steelblue") +
+  geom_text(aes(label = borough), vjust = -1, size = 3) +
+  geom_smooth(method = "lm", color = "red", se = FALSE, linetype = "dashed") +
+  scale_x_continuous(labels = scales::dollar) +
+  labs(
+    title = "Do Lower-Income Boroughs File More Complaints?",
+    x = "Median Household Income",
+    y = "Complaints per 1,000 Residents"
+  ) +
+  theme_minimal()
+```
+
+##  Housing Complaints vs Renter Percentage
+
+```{r}
+# Housing-related complaints by renter percentage
+housing_renter <- df_311 %>%
+  filter(complaint_type %in% c("HEAT/HOT WATER", "PLUMBING", "WATER SYSTEM", "UNSANITARY CONDITION")) %>%
+  filter(!is.na(borough) & borough != "Unspecified") %>%
+  group_by(borough, pct_renter, population) %>%
+  summarise(housing_complaints = n(), .groups = "drop") %>%
+  mutate(housing_per_1000 = housing_complaints / population * 1000)
+
+ggplot(housing_renter, aes(x = pct_renter, y = housing_per_1000)) +
+  geom_point(size = 5, color = "orange") +
+  geom_text(aes(label = borough), vjust = -1, size = 3) +
+  geom_smooth(method = "lm", color = "red", se = FALSE, linetype = "dashed") +
+  labs(
+    title = "Housing Complaints Higher in Renter-Heavy Boroughs",
+    x = "Percent Renter-Occupied Housing",
+    y = "Housing Complaints per 1,000 Residents"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+## Model the data
+
+#### Diagnosing Delays: Predicting 311 Response Time with Random Forest
+
+```{r}
+# Load required libraries
+library(randomForest)
+library(caret)
+library(tibble)
+
+# Prepare modeling dataset WITH weather and demographics
+model_data <- df_response %>%
+  filter(!is.na(borough) & borough != "Unspecified" & 
+         !is.na(complaint_type) & !is.na(hour) & !is.na(day_of_week) &
+         !is.na(temp_mean_f) & !is.na(median_income)) %>%  # NEW: require weather & demographics
+  select(
+    response_time, 
+    borough, 
+    complaint_type, 
+    hour, 
+    day_of_week, 
+    month,
+    # NEW: Weather features
+    temp_mean_f,
+    precipitation_mm,
+    # NEW: Demographics features
+    median_income,
+    pct_renter,
+    pct_poverty
+  ) %>%
+  # Keep top complaint types to avoid sparse categories
+  filter(complaint_type %in% names(sort(table(df_response$complaint_type), decreasing = TRUE)[1:20])) %>%
+  mutate(across(where(is.character), as.factor))
+
+# Check structure - verify new columns are included
+str(model_data)
+cat("\nColumns in model:", colnames(model_data), "\n")
+
+# Split data: 80% train, 20% test
+set.seed(42)
+train_index <- createDataPartition(model_data$response_time, p = 0.8, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+cat("Training set:", nrow(train_data), "rows\n")
+cat("Test set:", nrow(test_data), "rows\n")
+
+# Train Random Forest model
+rf_model <- randomForest(
+  response_time ~ ., 
+  data = train_data,
+  ntree = 200,
+  mtry = 3,           # Increased from 2 since we have more variables
+  importance = TRUE,
+  na.action = na.omit
+)
+
+# Model summary
+print(rf_model)
+
+# Variable Importance - KEY OUTPUT for interpretation
+importance_df <- as.data.frame(importance(rf_model)) %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(`%IncMSE`))
+
+print("Variable Importance (% Increase in MSE when removed):")
+print(importance_df)
+
+# Variable Importance Plot
+varImpPlot(rf_model, main = "Variable Importance: Predicting 311 Response Time\n(Including Weather & Demographics)")
+
+# Predictions on test set
+predictions <- predict(rf_model, newdata = test_data)
+
+# Model Evaluation Metrics
+actuals <- test_data$response_time
+rmse <- sqrt(mean((predictions - actuals)^2))
+mae <- mean(abs(predictions - actuals))
+r_squared <- 1 - sum((actuals - predictions)^2) / sum((actuals - mean(actuals))^2)
+
+cat("\n--- Model Performance on Test Set ---\n")
+cat("RMSE:", round(rmse, 2), "hours\n")
+cat("MAE:", round(mae, 2), "hours\n")
+cat("R-squared:", round(r_squared, 4), "\n")
+
+# Actual vs Predicted Plot
+results_df <- data.frame(Actual = actuals, Predicted = predictions)
+
+ggplot(results_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(
+    title = "Random Forest: Actual vs Predicted Response Time",
+    subtitle = paste("R² =", round(r_squared, 3), "| RMSE =", round(rmse, 2), "hours"),
+    x = "Actual Response Time (Hours)",
+    y = "Predicted Response Time (Hours)"
+  ) +
+  theme_minimal()
+```
+## Interpret the data
+
+
+The Random Forest model reveals that **complaint type** is the strongest 
+predictor of response time, followed by **borough**. This suggests that 
+operational workflows—not just geographic location—drive resolution speed.
+
+The model's R² of 0.7117 indicates that 71% of response time 
+variability can be explained by these factors. The remaining variance 
+likely stems from factors not in our dataset: inspector availability, 
+complaint complexity, or whether violations were found.
+
+RMSE = 11.14 hours
+Predictions are accurate within approximately  0.46 days(about half a day) sufficient for operational triage and resource planning.
+
+
+## The Biggest Challenges Encountered in Completing the Project
+
+- The biggest challenge I had in completing. This code was learning how to build, update and modify a Shiny app. The process felt similar to developing a User Experience(UX) application which is quite a challenging feature.
+
+- My second biggest challenge was developing meaningful insight from the data. I used three API’s in this project and only one from NYC open data allowed me to get a max of 80000 data points. Since 311 gather thousands of service calls in a day, 80,0000 data pints  approximates to a  few data of data. With the variety of visualizations, I was able to with trial and error develop meaningful plots. 
+
+-  The third challenge I had while completing this project is that since there were so many dependencies, Shiny app code, Random forest model, dataset to merge, simple changes meant virtually doing the project over from the start. The process, though tedious, was worthwhile as I developed a comprehensive project that  am proud of. 
+
+
+
+
