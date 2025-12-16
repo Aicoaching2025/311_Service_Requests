@@ -2,16 +2,20 @@
 title: "Final Project 607"
 author: "Candace Grant"
 date: "2025-11-28"
-output: html_document
+output:
+  html_document:
+    toc: true
+  pdf_document:
+    toc: true
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## Project Proposal with data sources using the OSEM workflow
 
-As a NYC resident and Data Science graduate student, I'm analyzing 311 service request data from 2010 to present to understand complaint patterns across our five boroughs. The 311 system is how we report non-emergency issues—from potholes and noise complaints to heat outages and street light repairs. By visualizing this data geographically, we can see where problems occur and how they cluster in specific neighborhoods.
+
+As a NYC resident and Data Science graduate student, I'm analyzing 311 service request data from 2010 to present to understand complaint patterns across our five boroughs. The 311 system is how we report non-emergency issues—from potholes and noise complaints to heat outages and street light repairs. By visualizing this data geographically, we can see where problems occur and how they cluster in specific neighborhoods. My  **primary hypothesis** is that  NYC 311 complaint patterns-including volume, type, and response times—are significantly influenced by weather conditions, neighborhood demographics, and borough characteristics.
 
 **How NYC Currently Uses 311 Data**
 
@@ -27,18 +31,31 @@ Performance Monitoring:
 * City leadership tracks which neighborhoods generate the most requests
 * Budget decisions are informed by service demand patterns
 
-**Technical Approach**
+---
 
-This project analyzes **NYC 311 service request data** to identify geographic complaint patterns and enable proactive municipal management. I will pull the data directly from the NYC Open Data Socrata API using the RSocrata package in R and download NYC geographic boundary files (boroughs, ZIP codes, community districts) using the tigris package for spatial mapping.
+## Introduction
 
-The data cleaning process will use dplyr, tidyr, and lubridate to remove records with missing coordinates, standardize complaint categories, convert dates to proper datetime format, and create time-based variables like year, month, and season for trend analysis.
+This project analyzes **NYC 311 service request data** to identify geographic complaint patterns and enable proactive municipal management. By integrating weather conditions and demographic characteristics, the analysis examines how environmental and socioeconomic factors influence service request volumes and types across neighborhoods. The project follows the **OSEMN data science workflow**—Obtain, Scrub, Explore, Model, and iNterpret—to ensure a systematic and reproducible approach from data acquisition through actionable insights.
 
-For visualization and analysis, I will create time series plots showing complaint trends over the years using ggplot2 and plotly, interactive maps displaying complaint density by neighborhood with leaflet and sf, heat maps revealing geographic hotspots, and comparison charts showing how complaint types differ across boroughs. 
+**Obtain:** Data will be acquired from three primary sources:
+- **NYC 311 Service Requests** via the NYC Open Data Socrata API using the RSocrata package in R
+- **Historical Weather Data** from Open-Meteo.com, a free open-source weather API requiring no API key, to capture temperature, precipitation, and other meteorological conditions corresponding to complaint dates
+- **Demographic Data** from the U.S. Census Bureau API (census.gov) to obtain population density, income levels, housing characteristics, and other socioeconomic indicators at the census tract or ZIP code level
+- **Geographic Boundary Files** (boroughs, ZIP codes, community districts) using the tigris package for spatial mapping and joining datasets
 
-My deliverable will be an interactive Shiny dashboard that allows users to filter by complaint type, date range, and borough. The dashboard will feature linked visualizations—an interactive map with complaint markers, dynamic time series charts, and summary statistics—where selections on one view automatically update the others. Users can explore patterns, download custom reports, and identify areas needing proactive intervention.
+**Scrub:** The data cleaning process will use dplyr, tidyr, and lubridate to remove records with missing coordinates, standardize complaint categories, convert dates to proper datetime format, and create time-based variables like year, month, and season for trend analysis. Weather data will be aligned with complaint records by date, and demographic data will be joined spatially by geographic identifier (ZIP code or census tract) to create an enriched analytical dataset.
 
+**Explore:** Exploratory data analysis will examine complaint distributions across boroughs, identify seasonal and weather-related trends, and investigate correlations between complaint types and neighborhood demographics. Preliminary visualizations will reveal geographic clustering patterns and potential relationships between environmental conditions and service request volumes.
 
-### Data sources
+**Model:** Statistical and spatial analysis techniques will be applied to quantify complaint hotspots, measure temporal trends, and identify significant patterns across neighborhoods and time periods. Regression models will assess the influence of weather variables (temperature extremes, precipitation events) and demographic factors (population density, median income) on complaint frequency and type.
+
+**iNterpret:** My deliverable will be an interactive Shiny dashboard that allows users to filter by complaint type, date range, borough, weather conditions, and demographic characteristics. The dashboard will feature linked visualizations—an interactive map with complaint markers, dynamic time series charts, weather overlays, demographic profiles, and summary statistics—where selections on one view automatically update the others. Users can explore patterns, download custom reports, and identify areas needing proactive intervention based on environmental and socioeconomic context.
+
+---
+
+## Obtain Data
+
+### Use API to gather NYC 311 data and place in a data frame called df_311
 
 ```{r}
 # Load required packages
@@ -84,7 +101,7 @@ sum(is.na(df_311$hour))
 
 ```
 
-## Data transformation on create date column
+### Data transformation on create date column
 
 ```{r}
 df_311 <- df_311 %>%
@@ -100,7 +117,8 @@ print(str(df_311))
 sum(is.na(df_311$hour))
 df_311 %>% count(day_of_week)
 ```
-## Weather Data Integration to Correlate Service Requests with Weather
+
+### Use API to gather weather data and left join weather data to the 311 data set (df_311)
 
 ```{r}
 
@@ -155,7 +173,8 @@ df_311 <- df_311 %>%
 cat("\nWeather columns added:", sum(!is.na(df_311$temp_mean_f)), "rows with weather data\n")
 
 ```
-## Adding demographic data to investigate the correlation with 311 Service Requests
+
+### Use API to gather demographic data and left join demographic data to the 311 data set (df_311)
 
 ```{r}
 library(tidycensus)
@@ -216,14 +235,140 @@ cat("Demographics joined:", sum(!is.na(df_311$population)), "rows with demograph
 head(df_311, 5)
 ```
 
+## Scrub the Data
+
+### Scrub:Data set overview and Missing values analysis
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+# 1. Dataset Overview
+
+cat("Rows:", nrow(df_311), "\n")
+cat("Columns:", ncol(df_311), "\n")
+glimpse(df_311)
 
 
+# 2. MISSING VALUES ANALYSIS
 
-## Scrub the data
-## Missing values- % by column know if to impute or drop, % of NA
+missing_summary <- df_311 %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count") %>%
+  mutate(
+    missing_pct = round(missing_count / nrow(df_311) * 100, 2),
+    recommendation = case_when(
+      missing_pct == 0 ~ "Complete",
+      missing_pct < 5 ~ "Impute",
+      missing_pct < 30 ~ "Impute with caution",
+      TRUE ~ "Consider dropping"
+    )
+  ) %>%
+  arrange(desc(missing_pct))
+
+print(missing_summary %>% filter(missing_pct > 0))
+```
+### Scrub: Drop columns with >30% of data missing
+
+```{r}
+# Identify columns with >30% missing
+threshold <- 0.30
+cols_to_drop <- names(df_311)[colSums(is.na(df_311)) / nrow(df_311) > threshold]
+
+cat("Dropping columns:", cols_to_drop, "\n")
+
+# Drop them
+df_311 <- df_311 %>%
+  select(-all_of(cols_to_drop))
+```
 
 
-## Data Visualizations and Statistical Analysis
+### Scrub: Identify duplicates, verify data types, and validate entries
+
+```{r}
+# 3. DUPLICATE ROWS
+
+cat("\n=== DUPLICATE ROWS ===\n")
+dup_count <- sum(duplicated(df_311))
+cat("Duplicate rows:", dup_count, "\n")
+cat("Duplicate %:", round(dup_count / nrow(df_311) * 100, 2), "%\n")
+
+# Remove duplicates (uncomment to execute)
+df_311 <- df_311 %>% distinct()
+
+
+# 4. DATA TYPES CHECK
+sapply(df_311, class)
+
+
+# 5. STANDARDIZE TEXT COLUMNS
+df_311 <- df_311 %>%
+  mutate(
+    # Trim whitespace and standardize case
+    borough = toupper(trimws(borough)),
+    complaint_type = toupper(trimws(complaint_type)),
+    # Standardize "Unspecified" values
+    borough = if_else(borough %in% c("", "UNSPECIFIED", "NA"), NA_character_, borough)
+  )
+
+cat("Unique boroughs:", unique(df_311$borough), "\n")
+
+
+# 6. INVALID/ILLOGICAL VALUES
+
+# Check: Closed date before Created date
+if ("closed_date" %in% names(df_311) & "created_date" %in% names(df_311)) {
+  invalid_dates <- df_311 %>%
+    filter(!is.na(closed_date) & closed_date < created_date)
+  cat("Invalid dates (closed before created):", nrow(invalid_dates), "\n")
+}
+
+# Check: Future dates
+future_dates <- df_311 %>%
+  filter(created_date > Sys.time())
+cat("Future dates:", nrow(future_dates), "\n")
+
+# Check: Negative response times
+if ("response_time" %in% names(df_311)) {
+  negative_response <- df_311 %>%
+    filter(response_time < 0)
+  cat("Negative response times:", nrow(negative_response), "\n")
+}
+```
+
+### Scrub: Outlier detection and cardinality check
+
+```{r}
+# 7. OUTLIER DETECTION (Numeric Columns)
+detect_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR
+  upper <- Q3 + 1.5 * IQR
+  sum(x < lower | x > upper, na.rm = TRUE)
+}
+
+numeric_cols <- df_311 %>% select(where(is.numeric)) %>% names()
+
+for (col in numeric_cols) {
+  outlier_count <- detect_outliers(df_311[[col]])
+  pct <- round(outlier_count / nrow(df_311) * 100, 2)
+  cat(col, ": ", outlier_count, " outliers (", pct, "%)\n", sep = "")
+}
+
+
+# 8. CARDINALITY CHECK
+cardinality <- df_311 %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "unique_values") %>%
+  arrange(desc(unique_values))
+
+print(cardinality)
+```
+## Explore the data
+### Data Visualizations and Statistical Analysis
 
 ```{r}
 library(ggplot2)
@@ -381,12 +526,12 @@ summary_stats <- df_response %>%
 print("Summary Statistics by Borough:")
 print(summary_stats)
 ```
-## Highlighting the feature that was not covered in class: Shiny app and dashboard
+### Explore: Shiny app and dashboard
 
 https://candacegrant2025.shinyapps.io/NYC_311_Requests/
 
 
-## Heating Complaints REsponse Time vs Tempaerature
+### Heating Complaints Response Time vs Tempaerature
 
 ```{r}
 # Filter heating complaints data
@@ -401,18 +546,18 @@ heating_count <- df_311 %>%
   summarise(complaints = n(), .groups = "drop")
 
 p1 <- ggplot(heating_count, aes(x = temp_mean_f, y = complaints)) +
-  geom_point(alpha = 0.5, color = "green") +
+  geom_point(alpha = 0.5, color = "navy") +
   labs(
     title = "Heating Complaint Volume vs Temperature",
     x = "Mean Daily Temperature (°F)",
     y = "Number of Complaints"
   ) +
   theme_minimal()
-print
+print(p1)
 
 ```
 
-## Noise complaints vs Temperature
+### Noise complaints vs Temperature
 
 ```{r}
 # Noise complaints - do they increase in warm weather?
@@ -435,7 +580,7 @@ cor.test(noise_temp$temp_mean_f, noise_temp$complaints)
 
 ```
 
-## Heatmap: Complaint Types vs Tempaerature Ranges
+### Heatmap: Complaint Types vs Tempaerature Ranges
 
 
 ```{r}
@@ -462,7 +607,7 @@ ggplot(temp_complaints, aes(x = temp_range, y = complaint_type, fill = n)) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
-## Complaints per capita vs Median Income
+### Complaints per capita vs Median Income
 
 ```{r}
 # Complaints per capita by borough
@@ -485,7 +630,7 @@ ggplot(complaints_per_capita, aes(x = median_income, y = complaints_per_1000)) +
   theme_minimal()
 ```
 
-##  Housing Complaints vs Renter Percentage
+###  Housing Complaints vs Renter Percentage
 
 ```{r}
 # Housing-related complaints by renter percentage
@@ -499,7 +644,7 @@ housing_renter <- df_311 %>%
 ggplot(housing_renter, aes(x = pct_renter, y = housing_per_1000)) +
   geom_point(size = 5, color = "orange") +
   geom_text(aes(label = borough), vjust = -1, size = 3) +
-  geom_smooth(method = "lm", color = "red", se = FALSE, linetype = "dashed") +
+  geom_smooth(method = "lm", color = "purple", se = FALSE, linetype = "dashed") +
   labs(
     title = "Housing Complaints Higher in Renter-Heavy Boroughs",
     x = "Percent Renter-Occupied Housing",
@@ -507,8 +652,6 @@ ggplot(housing_renter, aes(x = pct_renter, y = housing_per_1000)) +
   ) +
   theme_minimal()
 ```
-
-
 
 
 ## Model the data
@@ -610,6 +753,7 @@ ggplot(results_df, aes(x = Actual, y = Predicted)) +
   ) +
   theme_minimal()
 ```
+
 ## Interpret the data
 
 
@@ -625,15 +769,48 @@ complaint complexity, or whether violations were found.
 RMSE = 11.14 hours
 Predictions are accurate within approximately  0.46 days(about half a day) sufficient for operational triage and resource planning.
 
+### Key Takeaways from the data
+
+```{r}
+library(knitr)
+
+interpretations <- data.frame(
+  Interpretation = c(
+    "Borough disparities",
+    "Complaint type matters most",
+    "Demographics drive demand",
+    "Temporal patterns exist",
+    "Predictions enable proactivity"
+  ),
+  Key_Insight = c(
+    "Manhattan/Brooklyn have highest variability",
+    "Type predicts response time better than location",
+    "Renter-heavy, lower-income areas file more complaints",
+    "Peak demand mid-week, daytime hours",
+    "71% of variance is explainable"
+  ),
+  Actionable_Recommendation = c(
+    "Audit workflows in high-variability boroughs",
+    "Develop complaint-specific SLAs",
+    "Proactive inspections in vulnerable neighborhoods",
+    "Align staffing to demand curves",
+    "Shift from reactive to predictive operations"
+  )
+)
+
+kable(interpretations, 
+      col.names = c("Interpretation", "Key Insight", "Actionable Recommendation"),
+      caption = "Key Interpretations from 311 Data Analysis")
+```
+
 
 ## The Biggest Challenges Encountered in Completing the Project
 
-- The biggest challenge I had in completing. This code was learning how to build, update and modify a Shiny app. The process felt similar to developing a User Experience(UX) application which is quite a challenging feature.
 
-- My second biggest challenge was developing meaningful insight from the data. I used three API’s in this project and only one from NYC open data allowed me to get a max of 80000 data points. Since 311 gather thousands of service calls in a day, 80,0000 data pints  approximates to a  few data of data. With the variety of visualizations, I was able to with trial and error develop meaningful plots. 
+- The biggest challenge I had in completing this project was learning how to build, update, and modify a Shiny app. The process felt similar to developing a User Experience (UX) application, which is quite a challenging feature.
 
--  The third challenge I had while completing this project is that since there were so many dependencies, Shiny app code, Random forest model, dataset to merge, simple changes meant virtually doing the project over from the start. The process, though tedious, was worthwhile as I developed a comprehensive project that  am proud of. 
+- My second biggest challenge was developing meaningful insights from the data. I used three APIs in this project, and only the NYC Open Data API allowed me to get a maximum of 80,000 data points. Since 311 gathers thousands of service calls in a day, 80,000 data points approximates to only a few days of data. With the variety of visualizations, I was able to develop meaningful plots through trial and error.
 
-
+- The third challenge I had while completing this project is that since there were so many dependencies—Shiny app code, Random Forest model, datasets to merge—simple changes meant virtually redoing the project from the start. The process, though tedious, was worthwhile as I developed a comprehensive project that I am proud of.
 
 
