@@ -1,1535 +1,792 @@
-# =============================================================================
-# NYC Electricity Consumption Analysis Dashboard
-# DATA 606 Final Project - Candace Grant
-# A Portfolio-Quality Shiny Application
-# =============================================================================
+# 311 Shiny App - WITH WEATHER & DEMOGRAPHICS ANALYSIS
 
 library(shiny)
 library(shinydashboard)
-library(shinyWidgets)
-library(httr)
-library(jsonlite)
-library(dplyr)
-library(ggplot2)
-library(lubridate)
+library(leaflet)
 library(plotly)
 library(DT)
-library(bslib)
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(lubridate)
+library(tidycensus)
 
-# =============================================================================
-# CUSTOM THEME & STYLING
-# =============================================================================
+# ============================================
+# DATA LOADING
+# ============================================
 
-# Custom CSS for a sophisticated, modern aesthetic
-custom_css <- "
-/* Import Google Fonts - Distinctive typography */
-@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Source+Sans+Pro:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+# --- 311 Data ---
+api_url <- "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
 
-/* Root variables for consistent theming */
-:root {
-  --primary-dark: #1a1a2e;
-  --primary-medium: #16213e;
-  --accent-coral: #e94560;
-  --accent-gold: #f5a623;
-  --accent-teal: #00d9c0;
-  --accent-purple: #7b68ee;
-  --text-light: #eaeaea;
-  --text-muted: #a0a0a0;
-  --card-bg: rgba(255, 255, 255, 0.03);
-  --card-border: rgba(255, 255, 255, 0.08);
-  --gradient-1: linear-gradient(135deg, #e94560 0%, #f5a623 100%);
-  --gradient-2: linear-gradient(135deg, #00d9c0 0%, #7b68ee 100%);
-  --gradient-3: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+query_params <- list(
+  `$limit` = 50000,
+  `$order` = "created_date DESC"
+)
+
+response <- GET(api_url, query = query_params)
+
+df_311 <- content(response, as = "text", encoding = "UTF-8") %>%
+  fromJSON(flatten = TRUE) %>%
+  as.data.frame() %>%
+  mutate(
+    created_date = as.POSIXct(created_date, format = "%Y-%m-%dT%H:%M:%S"),
+    closed_date = as.POSIXct(closed_date, format = "%Y-%m-%dT%H:%M:%S"),
+    date_only = as.Date(created_date),
+    month = floor_date(date_only, "month"),
+    latitude = as.numeric(latitude),
+    longitude = as.numeric(longitude),
+    hour = hour(created_date),
+    day_of_week = wday(created_date, label = TRUE, abbr = FALSE),
+    month_name = month(created_date, label = TRUE, abbr = FALSE),
+    response_time = as.numeric(difftime(closed_date, created_date, units = "hours"))
+  )
+
+# --- Weather Data ---
+start_date <- min(df_311$date_only, na.rm = TRUE)
+end_date <- max(df_311$date_only, na.rm = TRUE)
+
+weather_url <- "https://archive-api.open-meteo.com/v1/archive"
+
+weather_params <- list(
+  latitude = 40.7128,
+  longitude = -74.0060,
+  start_date = as.character(start_date),
+  end_date = as.character(end_date),
+  daily = "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum",
+  timezone = "America/New_York"
+)
+
+weather_response <- GET(weather_url, query = weather_params)
+
+if (status_code(weather_response) == 200) {
+  weather_json <- fromJSON(content(weather_response, "text", encoding = "UTF-8"))
+  
+  weather_df <- data.frame(
+    date = as.Date(weather_json$daily$time),
+    temp_max_f = weather_json$daily$temperature_2m_max * 9/5 + 32,
+    temp_min_f = weather_json$daily$temperature_2m_min * 9/5 + 32,
+    temp_mean_f = weather_json$daily$temperature_2m_mean * 9/5 + 32,
+    precipitation_mm = weather_json$daily$precipitation_sum
+  )
+  
+  # Join weather to 311 data
+  df_311 <- df_311 %>%
+    left_join(weather_df, by = c("date_only" = "date"))
 }
 
-/* Body styling */
-body {
-  font-family: 'Source Sans Pro', sans-serif;
-  font-size: 16px;
-  background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
-  color: var(--text-light);
-  min-height: 100vh;
-}
+# --- Demographics Data ---
+nyc_demographics <- data.frame(
+  borough = c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND"),
+  population = c(1472654, 2736074, 1694263, 2405464, 495747),
+  median_income = c(43726, 67572, 93651, 75748, 85381),
+  pct_renter = c(80.2, 69.8, 75.6, 54.3, 35.8),
+  pct_poverty = c(26.8, 19.2, 15.6, 11.4, 10.2)
+)
 
-/* Dashboard header */
-.main-header .logo {
-  font-family: 'Playfair Display', serif;
-  font-weight: 700;
-  font-size: 20px;
-  background: var(--gradient-1) !important;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
+# Join demographics to 311 data
+df_311 <- df_311 %>%
+  left_join(nyc_demographics, by = "borough")
 
-.main-header .navbar {
-  background: rgba(26, 26, 46, 0.95) !important;
-  backdrop-filter: blur(10px);
-  border-bottom: 1px solid var(--card-border);
-}
+# ============================================
+# SCRUB DATA
+# ============================================
 
-/* Sidebar styling */
-.main-sidebar {
-  background: linear-gradient(180deg, #1a1a2e 0%, #0f0f1a 100%) !important;
-  border-right: 1px solid var(--card-border);
-}
+df_311 <- df_311 %>%
+  distinct() %>%
+  mutate(
+    borough = toupper(trimws(borough)),
+    complaint_type = toupper(trimws(complaint_type)),
+    borough = if_else(borough %in% c("", "UNSPECIFIED", "NA"), NA_character_, borough)
+  ) %>%
+  filter(is.na(closed_date) | closed_date >= created_date) %>%
+  filter(created_date <= Sys.time()) %>%
+  mutate(
+    response_time = if_else(response_time < 0, NA_real_, response_time)
+  )
 
-.sidebar-menu > li > a {
-  font-family: 'Source Sans Pro', sans-serif;
-  font-weight: 600;
-  color: var(--text-muted) !important;
-  border-left: 3px solid transparent;
-  transition: all 0.3s ease;
-}
-
-.sidebar-menu > li > a:hover,
-.sidebar-menu > li.active > a {
-  background: rgba(233, 69, 96, 0.1) !important;
-  color: var(--accent-coral) !important;
-  border-left: 3px solid var(--accent-coral);
-}
-
-.sidebar-menu > li > a > .fa {
-  color: var(--accent-teal);
-}
-
-/* Content wrapper */
-.content-wrapper {
-  background: transparent !important;
-}
-
-/* Box styling */
-.box {
-  background: var(--card-bg);
-  border: 1px solid var(--card-border);
-  border-radius: 16px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-  backdrop-filter: blur(10px);
-}
-
-.box-header {
-  border-bottom: 1px solid var(--card-border);
-  padding: 20px 25px;
-}
-
-.box-title {
-  font-family: 'Playfair Display', serif;
-  font-weight: 600;
-  font-size: 1.3rem;
-  color: var(--text-light);
-}
-
-.box-body {
-  padding: 25px;
-}
-
-/* Value boxes */
-.small-box {
-  border-radius: 16px;
-  overflow: hidden;
-  border: 1px solid var(--card-border);
-  transition: transform 0.3s ease, box-shadow 0.3s ease;
-}
-
-.small-box:hover {
-  transform: translateY(-5px);
-  box-shadow: 0 12px 40px rgba(233, 69, 96, 0.2);
-}
-
-.small-box.bg-aqua {
-  background: linear-gradient(135deg, #00d9c0 0%, #00b4a0 100%) !important;
-}
-
-.small-box.bg-yellow {
-  background: linear-gradient(135deg, #f5a623 0%, #e09000 100%) !important;
-}
-
-.small-box.bg-red {
-  background: linear-gradient(135deg, #e94560 0%, #c73050 100%) !important;
-}
-
-.small-box.bg-purple {
-  background: linear-gradient(135deg, #7b68ee 0%, #6050d0 100%) !important;
-}
-
-.small-box h3 {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 2.2rem;
-  font-weight: 500;
-}
-
-.small-box p {
-  font-family: 'Source Sans Pro', sans-serif;
-  font-weight: 600;
-  font-size: 1rem;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-}
-
-/* Tab styling */
-.nav-tabs {
-  border-bottom: 1px solid var(--card-border);
-  margin-bottom: 20px;
-}
-
-.nav-tabs > li > a {
-  font-family: 'Source Sans Pro', sans-serif;
-  font-weight: 600;
-  color: var(--text-muted);
-  border: none;
-  border-bottom: 3px solid transparent;
-  background: transparent;
-  padding: 12px 24px;
-  transition: all 0.3s ease;
-}
-
-.nav-tabs > li > a:hover {
-  background: rgba(233, 69, 96, 0.1);
-  color: var(--accent-coral);
-  border-color: transparent;
-}
-
-.nav-tabs > li.active > a,
-.nav-tabs > li.active > a:hover,
-.nav-tabs > li.active > a:focus {
-  background: transparent;
-  color: var(--accent-coral);
-  border: none;
-  border-bottom: 3px solid var(--accent-coral);
-}
-
-/* Tables */
-.dataTables_wrapper {
-  color: var(--text-light);
-}
-
-table.dataTable {
-  border-collapse: collapse !important;
-}
-
-table.dataTable thead th {
-  font-family: 'Source Sans Pro', sans-serif;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  font-size: 0.85rem;
-  color: var(--accent-teal);
-  border-bottom: 2px solid var(--accent-teal) !important;
-  padding: 15px 10px;
-}
-
-table.dataTable tbody td {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.9rem;
-  padding: 12px 10px;
-  border-bottom: 1px solid var(--card-border);
-  color: var(--text-light);
-}
-
-table.dataTable tbody tr:hover {
-  background: rgba(233, 69, 96, 0.1) !important;
-}
-
-/* Select inputs */
-.selectize-input {
-  background: var(--primary-medium) !important;
-  border: 1px solid var(--card-border) !important;
-  border-radius: 8px !important;
-  color: var(--text-light) !important;
-  font-family: 'Source Sans Pro', sans-serif;
-}
-
-.selectize-dropdown {
-  background: var(--primary-dark) !important;
-  border: 1px solid var(--card-border) !important;
-  border-radius: 8px !important;
-}
-
-.selectize-dropdown-content .option {
-  color: var(--text-light);
-}
-
-.selectize-dropdown-content .option:hover,
-.selectize-dropdown-content .option.active {
-  background: var(--accent-coral) !important;
-}
-
-/* Picker input (shinyWidgets) */
-.picker .btn {
-  background: var(--primary-medium) !important;
-  border: 1px solid var(--card-border) !important;
-  color: var(--text-light) !important;
-  border-radius: 8px !important;
-}
-
-/* Action buttons */
-.btn-primary {
-  background: var(--gradient-1) !important;
-  border: none !important;
-  border-radius: 8px !important;
-  font-family: 'Source Sans Pro', sans-serif;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  padding: 12px 24px;
-  transition: all 0.3s ease;
-}
-
-.btn-primary:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 20px rgba(233, 69, 96, 0.4);
-}
-
-/* Statistical output styling */
-.stat-output {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.9rem;
-  background: rgba(0, 0, 0, 0.3);
-  border-radius: 8px;
-  padding: 20px;
-  border-left: 4px solid var(--accent-teal);
-  overflow-x: auto;
-  white-space: pre-wrap;
-}
-
-/* Hypothesis text */
-.hypothesis-box {
-  background: rgba(123, 104, 238, 0.1);
-  border: 1px solid rgba(123, 104, 238, 0.3);
-  border-radius: 12px;
-  padding: 20px;
-  margin-bottom: 20px;
-}
-
-.hypothesis-box h4 {
-  font-family: 'Playfair Display', serif;
-  color: var(--accent-purple);
-  margin-bottom: 15px;
-}
-
-.hypothesis-box p {
-  font-family: 'Source Sans Pro', sans-serif;
-  line-height: 1.8;
-  margin-bottom: 10px;
-}
-
-/* Decision box */
-.decision-box {
-  background: rgba(233, 69, 96, 0.1);
-  border: 1px solid rgba(233, 69, 96, 0.3);
-  border-radius: 12px;
-  padding: 20px;
-  margin-top: 20px;
-}
-
-.decision-box.significant {
-  border-color: var(--accent-teal);
-  background: rgba(0, 217, 192, 0.1);
-}
-
-/* Info cards */
-.info-card {
-  background: var(--card-bg);
-  border: 1px solid var(--card-border);
-  border-radius: 12px;
-  padding: 25px;
-  margin-bottom: 20px;
-  transition: all 0.3s ease;
-}
-
-.info-card:hover {
-  border-color: var(--accent-coral);
-  box-shadow: 0 8px 30px rgba(233, 69, 96, 0.15);
-}
-
-.info-card h4 {
-  font-family: 'Playfair Display', serif;
-  color: var(--accent-gold);
-  margin-bottom: 15px;
-}
-
-/* Abstract section */
-.abstract-text {
-  font-family: 'Source Sans Pro', sans-serif;
-  font-size: 1.1rem;
-  line-height: 1.9;
-  color: var(--text-light);
-  text-align: justify;
-}
-
-/* Section headers */
-.section-header {
-  font-family: 'Playfair Display', serif;
-  font-size: 2rem;
-  font-weight: 700;
-  background: var(--gradient-1);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  margin-bottom: 30px;
-  padding-bottom: 15px;
-  border-bottom: 1px solid var(--card-border);
-}
-
-/* Plotly styling adjustments */
-.plotly {
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-/* Loading spinner */
-.shiny-busy {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  z-index: 9999;
-}
-
-/* Scrollbar styling */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-::-webkit-scrollbar-track {
-  background: var(--primary-dark);
-}
-
-::-webkit-scrollbar-thumb {
-  background: var(--accent-coral);
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: var(--accent-gold);
-}
-
-/* Footer */
-.footer-text {
-
-  font-family: 'Source Sans Pro', sans-serif;
-  color: var(--text-muted);
-  text-align: center;
-  padding: 20px;
-  font-size: 0.9rem;
-}
-"
-
-# =============================================================================
-# UI DEFINITION
-# =============================================================================
-
+# ============================================
+# UI
+# ============================================
 ui <- dashboardPage(
-  skin = "black",
+  dashboardHeader(title = "NYC 311 Monitoring Tool"),
   
-  # Header
-  dashboardHeader(
-    title = "NYC Energy Analytics",
-    titleWidth = 280
-  ),
-  
-  # Sidebar
   dashboardSidebar(
-    width = 280,
     sidebarMenu(
-      id = "tabs",
-      menuItem("Overview", tabName = "overview", icon = icon("home")),
-      menuItem("Data Explorer", tabName = "explorer", icon = icon("search")),
-      menuItem("Visualizations", tabName = "visualizations", icon = icon("chart-bar")),
-      menuItem("ANOVA Analysis", tabName = "anova", icon = icon("flask")),
-      menuItem("Regression", tabName = "regression", icon = icon("chart-line")),
-      menuItem("Conclusions", tabName = "conclusions", icon = icon("flag-checkered")),
-      
-      hr(),
-      
-      # Filters
-      div(style = "padding: 15px;",
-          h4(style = "color: #a0a0a0; font-family: 'Source Sans Pro', sans-serif; margin-bottom: 15px;", 
-             "FILTERS"),
-          
-          pickerInput(
-            inputId = "borough_filter",
-            label = "Select Boroughs:",
-            choices = c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND"),
-            selected = c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND"),
-            multiple = TRUE,
-            options = list(
-              `actions-box` = TRUE,
-              `selected-text-format` = "count > 2"
-            )
-          ),
-          
-          pickerInput(
-            inputId = "season_filter",
-            label = "Select Seasons:",
-            choices = c("Winter", "Spring", "Summer", "Fall"),
-            selected = c("Winter", "Spring", "Summer", "Fall"),
-            multiple = TRUE,
-            options = list(
-              `actions-box` = TRUE
-            )
-          )
-      )
-    )
-  ),
-  
-  # Body
-  dashboardBody(
-    tags$head(
-      tags$style(HTML(custom_css))
+      menuItem("Overview", tabName = "overview", icon = icon("dashboard")),
+      menuItem("Borough Analysis", tabName = "borough", icon = icon("map")),
+      menuItem("Complaint Patterns", tabName = "complaints", icon = icon("exclamation-circle")),
+      menuItem("Response Time Analysis", tabName = "response", icon = icon("hourglass-half")),
+      menuItem("Weather & Demographics", tabName = "correlations", icon = icon("chart-line"))
     ),
     
+    hr(),
+    h4("  Filters", style = "padding-left: 15px;"),
+    
+    selectInput("borough", "Select Borough:",
+                choices = c("All", unique(df_311$borough[!is.na(df_311$borough) & df_311$borough != "Unspecified"])),
+                selected = "All"),
+    
+    selectInput("complaint", "Complaint Type:",
+                choices = c("All", names(sort(table(df_311$complaint_type), decreasing = TRUE)[1:25])),
+                selected = "All"),
+    
+    dateRangeInput("dates", "Date Range:",
+                   start = min(df_311$date_only, na.rm = TRUE),
+                   end = max(df_311$date_only, na.rm = TRUE),
+                   format = "yyyy-mm-dd",
+                   separator = " to ")
+  ),
+  
+  dashboardBody(
+    tags$style(HTML("
+      .small-box h3 { font-size: 20px; }
+      .box-header { font-weight: bold; }
+      .shiny-date-input { width: 100%; }
+      .input-daterange input { font-size: 12px; }
+      .input-daterange { width: 100%; }
+    ")),
+    
     tabItems(
-      # =======================================================================
-      # OVERVIEW TAB
-      # =======================================================================
-      tabItem(
-        tabName = "overview",
-        
-        fluidRow(
-          column(12,
-                 h1(class = "section-header", "NYC Electricity Consumption Analysis"),
-                 div(class = "abstract-text", style = "margin-bottom: 40px;",
-                     p("This study investigates whether temporal and geographical factors predict electricity 
-                charges across New York City boroughs using data from the NYC Open Data Electric 
-                Consumption and Cost dataset. The dataset, sourced from the New York City Housing 
-                Authority (NYCHA), contains 539,000 electric consumption records spanning 2010 
-                through May 2025."),
-                     p("Four statistical methods were employed: one-way ANOVA for borough effect, one-way 
-                ANOVA for season effect, two-way ANOVA with interaction, and multiple linear regression. 
-                Results indicate that both borough and season are statistically significant predictors 
-                of electricity charges, with Staten Island exhibiting the highest mean charges and 
-                summer months showing charges approximately $2,800 higher than winter months.")
-                 )
-          )
-        ),
-        
-        # Value Boxes
-        fluidRow(
-          valueBoxOutput("total_records", width = 3),
-          valueBoxOutput("avg_charge", width = 3),
-          valueBoxOutput("total_boroughs", width = 3),
-          valueBoxOutput("date_range", width = 3)
-        ),
-        
-        fluidRow(
-          column(6,
-                 box(
-                   title = "Research Question",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   div(class = "info-card",
-                       h4(icon("question-circle"), " Primary Question"),
-                       p(style = "font-size: 1.1rem; line-height: 1.8;",
-                         "What temporal and geographical factors best predict electricity charges 
-                  across NYC boroughs?"),
-                       hr(),
-                       h4(icon("bullseye"), " Variables"),
-                       tags$ul(
-                         tags$li(strong("Response Variable:"), " Current monthly charges ($)"),
-                         tags$li(strong("Explanatory Variables:"), " Borough (geographic), Season (temporal)")
-                       )
-                   )
-                 )
-          ),
-          column(6,
-                 box(
-                   title = "Key Findings",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   div(class = "info-card",
-                       h4(icon("lightbulb"), " Summary of Results"),
-                       tags$ul(style = "font-size: 1rem; line-height: 2;",
-                               tags$li("Both borough and season are ", strong("statistically significant"), " predictors (p < 0.001)"),
-                               tags$li("Staten Island has ", strong("highest"), " mean charges across all boroughs"),
-                               tags$li("Summer charges are ", strong("~$2,800 higher"), " than winter"),
-                               tags$li("Significant ", strong("interaction effect"), " between borough and season"),
-                               tags$li("Model R² ≈ 2% — other factors explain most variation")
-                       )
-                   )
-                 )
-          )
-        )
+      
+      # ---- TAB 1: OVERVIEW ----
+      tabItem(tabName = "overview",
+              h2("NYC 311 Service Requests: Overview"),
+              
+              fluidRow(
+                valueBoxOutput("total_complaints", width = 4),
+                valueBoxOutput("top_complaint", width = 4),
+                valueBoxOutput("avg_response", width = 4)
+              ),
+              
+              fluidRow(
+                box(title = "Complaint Locations", 
+                    width = 12, 
+                    leafletOutput("map", height = 500),
+                    footer = "Click markers to see complaint details. Use filters to narrow by borough and complaint type.")
+              ),
+              
+              fluidRow(
+                box(title = "Complaint Count by Type", 
+                    width = 6, 
+                    DTOutput("complaint_count_table", height = 350)),
+                box(title = "Complaint Count by Location (Address)", 
+                    width = 6, 
+                    DTOutput("location_count_table", height = 350))
+              )
       ),
       
-      # =======================================================================
-      # DATA EXPLORER TAB
-      # =======================================================================
-      tabItem(
-        tabName = "explorer",
-        
-        fluidRow(
-          column(12,
-                 h1(class = "section-header", "Data Explorer")
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Dataset Preview",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   DTOutput("data_table")
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(6,
-                 box(
-                   title = "Summary Statistics by Borough",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   DTOutput("borough_summary")
-                 )
-          ),
-          column(6,
-                 box(
-                   title = "Summary Statistics by Season",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   DTOutput("season_summary")
-                 )
-          )
-        )
+      # ---- TAB 2: BOROUGH ANALYSIS ----
+      tabItem(tabName = "borough",
+              h2("Borough-Level Analysis"),
+              p("Examining how service requests and response times vary across NYC's five boroughs."),
+              
+              fluidRow(
+                box(title = "Complaint Volume by Borough",
+                    width = 6,
+                    plotlyOutput("borough_volume_plot", height = 350)),
+                box(title = "Top Complaint Types by Borough",
+                    width = 6,
+                    plotlyOutput("borough_complaint_heatmap", height = 350))
+              ),
+              
+              fluidRow(
+                box(title = "Borough Comparison: Key Metrics",
+                    width = 12,
+                    DTOutput("borough_summary_table"))
+              ),
+              
+              fluidRow(
+                box(title = "Complaint Distribution Within Each Borough",
+                    width = 12,
+                    plotlyOutput("borough_facet_plot", height = 500))
+              )
       ),
       
-      # =======================================================================
-      # VISUALIZATIONS TAB
-      # =======================================================================
-      tabItem(
-        tabName = "visualizations",
-        
-        fluidRow(
-          column(12,
-                 h1(class = "section-header", "Interactive Visualizations")
-          )
-        ),
-        
-        fluidRow(
-          column(6,
-                 box(
-                   title = "Current Charges Distribution by Borough",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   plotlyOutput("boxplot_borough", height = "400px")
-                 )
-          ),
-          column(6,
-                 box(
-                   title = "Mean Charges by Borough",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   plotlyOutput("barplot_borough", height = "400px")
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(6,
-                 box(
-                   title = "Mean Charges by Season",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   plotlyOutput("barplot_season", height = "400px")
-                 )
-          ),
-          column(6,
-                 box(
-                   title = "Borough × Season Interaction",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   plotlyOutput("interaction_plot", height = "400px")
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Heatmap: Mean Charges by Borough and Season",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   plotlyOutput("heatmap", height = "450px")
-                 )
-          )
-        )
+      # ---- TAB 3: COMPLAINT PATTERNS ----
+      tabItem(tabName = "complaints",
+              h2("Complaint Type Analysis"),
+              p("Understanding which types of complaints are most common and how they vary by location."),
+              
+              fluidRow(
+                box(title = "Top 15 Complaint Types",
+                    width = 6,
+                    plotlyOutput("top_complaints_plot", height = 400)),
+                box(title = "Complaint Type Distribution",
+                    width = 6,
+                    plotlyOutput("complaint_pie", height = 400))
+              ),
+              
+              fluidRow(
+                box(title = "Complaint Types by Borough (Heatmap)",
+                    width = 12,
+                    plotlyOutput("complaint_borough_heatmap", height = 450))
+              ),
+              
+              fluidRow(
+                box(title = "Complaint Type Statistics",
+                    width = 12,
+                    DTOutput("complaint_stats_table"))
+              )
       ),
       
-      # =======================================================================
-      # ANOVA TAB
-      # =======================================================================
-      tabItem(
-        tabName = "anova",
-        
-        fluidRow(
-          column(12,
-                 h1(class = "section-header", "Analysis of Variance (ANOVA)")
-          )
-        ),
-        
-        # Borough ANOVA
-        fluidRow(
-          column(12,
-                 box(
-                   title = "One-Way ANOVA: Effect of Borough on Current Charges",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   
-                   div(class = "hypothesis-box",
-                       h4(icon("file-alt"), " Hypothesis Test"),
-                       p(strong("Null Hypothesis (H₀):"), " There is no difference in mean current charges among NYC boroughs."),
-                       p(strong("Alternative Hypothesis (H₁):"), " At least one borough has a significantly different mean current charge."),
-                       p(strong("Significance Level:"), " α = 0.05")
-                   ),
-                   
-                   h4("ANOVA Results:", style = "color: #00d9c0; margin-top: 25px;"),
-                   verbatimTextOutput("anova_borough_output"),
-                   
-                   uiOutput("anova_borough_decision"),
-                   
-                   h4("Post-Hoc Analysis: Tukey's HSD", style = "color: #f5a623; margin-top: 25px;"),
-                   verbatimTextOutput("tukey_borough_output")
-                 )
-          )
-        ),
-        
-        # Season ANOVA
-        fluidRow(
-          column(12,
-                 box(
-                   title = "One-Way ANOVA: Effect of Season on Current Charges",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   
-                   div(class = "hypothesis-box",
-                       h4(icon("file-alt"), " Hypothesis Test"),
-                       p(strong("Null Hypothesis (H₀):"), " There is no difference in mean current charges among seasons."),
-                       p(strong("Alternative Hypothesis (H₁):"), " At least one season has a significantly different mean current charge."),
-                       p(strong("Significance Level:"), " α = 0.05")
-                   ),
-                   
-                   h4("ANOVA Results:", style = "color: #00d9c0; margin-top: 25px;"),
-                   verbatimTextOutput("anova_season_output"),
-                   
-                   uiOutput("anova_season_decision"),
-                   
-                   h4("Post-Hoc Analysis: Tukey's HSD", style = "color: #f5a623; margin-top: 25px;"),
-                   verbatimTextOutput("tukey_season_output")
-                 )
-          )
-        ),
-        
-        # Two-Way ANOVA
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Two-Way ANOVA: Borough × Season Interaction",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   
-                   div(class = "hypothesis-box",
-                       h4(icon("file-alt"), " Hypothesis Tests"),
-                       p(strong("1. Main Effect of Borough")),
-                       p("H₀: No difference in mean charges among boroughs | H₁: At least one borough differs"),
-                       p(strong("2. Main Effect of Season")),
-                       p("H₀: No difference in mean charges among seasons | H₁: At least one season differs"),
-                       p(strong("3. Interaction Effect (Borough × Season)")),
-                       p("H₀: The effect of season on charges is the same across all boroughs"),
-                       p("H₁: The effect of season on charges differs by borough"),
-                       p(strong("Significance Level:"), " α = 0.05")
-                   ),
-                   
-                   h4("Two-Way ANOVA Results:", style = "color: #00d9c0; margin-top: 25px;"),
-                   verbatimTextOutput("anova_twoway_output"),
-                   
-                   uiOutput("anova_twoway_decision")
-                 )
-          )
-        )
+      # ---- TAB 4: RESPONSE TIME ANALYSIS ----
+      tabItem(tabName = "response",
+              h2("Response Time Analysis"),
+              p("How quickly are 311 complaints resolved? Are there disparities across boroughs or complaint types?"),
+              
+              fluidRow(
+                valueBoxOutput("median_response", width = 4),
+                valueBoxOutput("pct_resolved_24h", width = 4),
+                valueBoxOutput("pct_resolved_week", width = 4)
+              ),
+              
+              fluidRow(
+                box(title = "Response Time Distribution",
+                    width = 6,
+                    plotlyOutput("response_histogram", height = 350),
+                    footer = "Distribution of resolution times (capped at 500 hours for visibility)."),
+                box(title = "Response Time by Borough",
+                    width = 6,
+                    plotlyOutput("response_borough_box", height = 350),
+                    footer = "Comparing resolution times across boroughs.")
+              ),
+              
+              fluidRow(
+                box(title = "Average Response Time by Complaint Type (Top 15)",
+                    width = 12,
+                    plotlyOutput("response_complaint_plot", height = 400))
+              ),
+              
+              fluidRow(
+                box(title = "Response Time Summary by Borough",
+                    width = 6,
+                    DTOutput("response_borough_table")),
+                box(title = "Response Time Summary by Complaint Type",
+                    width = 6,
+                    DTOutput("response_complaint_table"))
+              )
       ),
       
-      # =======================================================================
-      # REGRESSION TAB
-      # =======================================================================
-      tabItem(
-        tabName = "regression",
-        
-        fluidRow(
-          column(12,
-                 h1(class = "section-header", "Multiple Linear Regression")
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Model Specification",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   
-                   div(class = "info-card",
-                       h4(icon("cogs"), " Model Details"),
-                       p(strong("Dependent Variable:"), " current_charges (monthly electricity charges in $)"),
-                       p(strong("Independent Variables:"), " borough (categorical), season (categorical)"),
-                       p(strong("Model Equation:")),
-                       p(code("current_charges = β₀ + β₁(borough) + β₂(season) + ε"), 
-                         style = "font-family: 'JetBrains Mono', monospace; font-size: 1.1rem;")
-                   )
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Regression Output",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   verbatimTextOutput("regression_output")
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(6,
-                 box(
-                   title = "95% Confidence Intervals",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   verbatimTextOutput("conf_int_output")
-                 )
-          ),
-          column(6,
-                 box(
-                   title = "Model Interpretation",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   uiOutput("regression_interpretation")
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Diagnostic Plots",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   plotOutput("diagnostic_plots", height = "500px")
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Effect Size Analysis",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   verbatimTextOutput("effect_size_output")
-                 )
-          )
-        )
-      ),
-      
-      # =======================================================================
-      # CONCLUSIONS TAB
-      # =======================================================================
-      tabItem(
-        tabName = "conclusions",
-        
-        fluidRow(
-          column(12,
-                 h1(class = "section-header", "Conclusions & Implications")
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Summary of Statistical Tests",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   DTOutput("summary_table")
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(6,
-                 box(
-                   title = "Key Findings",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   div(class = "info-card",
-                       h4(icon("check-circle"), style = "color: #00d9c0;", " Confirmed Results"),
-                       tags$ul(style = "font-size: 1rem; line-height: 2;",
-                               tags$li("Both borough and season are ", strong("statistically significant"), 
-                                       " predictors of electricity charges (p < 0.001)"),
-                               tags$li("Staten Island has ", strong("substantially higher"), 
-                                       " charges than all other boroughs (~$10,000 higher)"),
-                               tags$li("Summer months show charges approximately ", strong("$2,800 higher"), 
-                                       " than winter months"),
-                               tags$li("The ", strong("interaction effect"), " is significant, meaning seasonal 
-                          patterns vary by borough"),
-                               tags$li("Combined model explains approximately ", strong("2%"), 
-                                       " of variance (R² ≈ 0.02)")
-                       )
-                   )
-                 )
-          ),
-          column(6,
-                 box(
-                   title = "Limitations",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   div(class = "info-card",
-                       h4(icon("exclamation-triangle"), style = "color: #f5a623;", " Study Limitations"),
-                       tags$ul(style = "font-size: 1rem; line-height: 2;",
-                               tags$li("Low R-squared indicates borough and season are ", strong("weak predictors"), 
-                                       " on their own"),
-                               tags$li("Dataset represents only ", strong("NYCHA properties"), 
-                                       ", not all NYC buildings"),
-                               tags$li("API limit of ", strong("50,000 rows"), 
-                                       " represents a subset of 539,000 total records"),
-                               tags$li("Observational study — ", strong("cannot establish causation"), 
-                                       ", only associations"),
-                               tags$li("Other factors (building size, rate class, usage type) likely explain more variance")
-                       )
-                   )
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 box(
-                   title = "Practical Implications",
-                   width = NULL,
-                   solidHeader = FALSE,
-                   div(class = "info-card",
-                       h4(icon("lightbulb"), style = "color: #7b68ee;", " Why This Matters"),
-                       p(style = "font-size: 1.05rem; line-height: 1.9;",
-                         "Understanding the geographic and temporal drivers of electricity costs supports 
-                  better resource planning for housing authorities, informs policy decisions about 
-                  energy assistance programs, and helps identify which communities face the highest 
-                  energy burdens. The finding that Staten Island has significantly higher charges 
-                  warrants further investigation into the underlying causes—whether due to building 
-                  characteristics, infrastructure differences, or rate structures."),
-                       p(style = "font-size: 1.05rem; line-height: 1.9;",
-                         "The significant summer spike across all boroughs suggests that targeted energy 
-                  efficiency programs focused on cooling costs could benefit NYCHA residents, 
-                  particularly in boroughs showing the largest seasonal variation.")
-                   )
-                 )
-          )
-        ),
-        
-        fluidRow(
-          column(12,
-                 div(class = "footer-text",
-                     p("DATA 606 Final Project | Candace Grant | CUNY School of Professional Studies"),
-                     p("Data Source: NYC Open Data - Electric Consumption and Cost (2010 - May 2025)")
-                 )
-          )
-        )
+      # ---- TAB 5: WEATHER & DEMOGRAPHICS CORRELATIONS ----
+      tabItem(tabName = "correlations",
+              h2("Weather & Demographics Analysis"),
+              p("Exploring how weather conditions and socioeconomic factors correlate with 311 complaints."),
+              
+              # Weather Section
+              h3("Weather Correlations", style = "margin-top: 20px;"),
+              
+              fluidRow(
+                box(title = "Complaint Types by Temperature Range",
+                    width = 6,
+                    plotlyOutput("temp_complaint_heatmap", height = 400),
+                    footer = "How complaint patterns shift with temperature"),
+                box(title = "Daily Complaints vs Temperature",
+                    width = 6,
+                    plotlyOutput("complaints_vs_temp", height = 400),
+                    footer = "Total daily complaints compared to mean temperature")
+              ),
+              
+              fluidRow(
+                box(title = "Heating Complaints by Temperature Range",
+                    width = 6,
+                    plotlyOutput("heating_vs_temp", height = 350),
+                    footer = "Heat/Hot Water complaints increase in cold weather"),
+                box(title = "Noise Complaints by Temperature Range",
+                    width = 6,
+                    plotlyOutput("noise_vs_temp", height = 350),
+                    footer = "Do noise complaints rise in warm weather?")
+              ),
+              
+              # Demographics Section
+              h3("Demographics Correlations", style = "margin-top: 30px;"),
+              
+              fluidRow(
+                box(title = "Housing Complaints vs Renter Percentage",
+                    width = 6,
+                    plotlyOutput("housing_vs_renter", height = 400),
+                    footer = "Housing-related complaints in renter-heavy boroughs"),
+                box(title = "Complaints per Capita vs Median Income",
+                    width = 6,
+                    plotlyOutput("complaints_vs_income", height = 400),
+                    footer = "Do lower-income boroughs file more complaints?")
+              ),
+              
+              fluidRow(
+                box(title = "Demographics Summary by Borough",
+                    width = 12,
+                    DTOutput("demographics_table"))
+              )
       )
-    )
+      
+    ) # End tabItems
   )
 )
 
-# =============================================================================
-# SERVER LOGIC
-# =============================================================================
-
+# ============================================
+# SERVER
+# ============================================
 server <- function(input, output, session) {
   
-  # ===========================================================================
-  # DATA LOADING AND PROCESSING
-  # ===========================================================================
-  
-  # Load data reactively
-  data <- reactive({
-    # Show loading notification
-    showNotification("Loading data from NYC Open Data API...", type = "message", duration = 3)
-    
-    # Pull data from API
-    response <- GET(
-      "https://data.cityofnewyork.us/resource/jr24-e7cr.json",
-      query = list(`$limit` = 50000)
-    )
-    
-    nyc_energy <- fromJSON(content(response, "text"))
-    nyc_energy_data <- as.data.frame(nyc_energy)
-    
-    # Clean and process
-    nyc_energy_clean <- nyc_energy_data %>%
-      mutate(
-        consumption_kwh = as.numeric(consumption_kwh),
-        consumption_kw = as.numeric(consumption_kw),
-        current_charges = as.numeric(current_charges),
-        kwh_charges = as.numeric(kwh_charges),
-        kw_charges = as.numeric(kw_charges),
-        other_charges = as.numeric(other_charges),
-        days = as.numeric(days),
-        revenue_month = as.Date(paste0(revenue_month, "-01")),
-        service_start_date = as.POSIXct(service_start_date, format = "%Y-%m-%dT%H:%M:%S"),
-        service_end_date = as.POSIXct(service_end_date, format = "%Y-%m-%dT%H:%M:%S")
-      ) %>%
-      filter(!is.na(consumption_kwh)) %>%
-      mutate(
-        month = month(revenue_month),
-        season = case_when(
-          month %in% c(12, 1, 2) ~ "Winter",
-          month %in% c(3, 4, 5) ~ "Spring",
-          month %in% c(6, 7, 8) ~ "Summer",
-          month %in% c(9, 10, 11) ~ "Fall",
-          TRUE ~ NA_character_
-        ),
-        season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall"))
-      )
-    
-    nyc_energy_clean
-  })
-  
-  # Filtered data based on user selection
+  # ---- Reactive: Filtered Data ----
   filtered_data <- reactive({
-    req(input$borough_filter, input$season_filter)
+    data <- df_311 %>%
+      filter(date_only >= input$dates[1] & date_only <= input$dates[2])
     
-    data() %>%
-      filter(
-        borough %in% input$borough_filter,
-        season %in% input$season_filter
-      ) %>%
-      mutate(
-        borough = factor(borough),
-        season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall"))
-      )
+    if (input$borough != "All") {
+      data <- data %>% filter(borough == input$borough)
+    }
+    
+    if (input$complaint != "All") {
+      data <- data %>% filter(complaint_type == input$complaint)
+    }
+    
+    data
   })
   
-  # ===========================================================================
-  # VALUE BOXES
-  # ===========================================================================
+  # Filtered response data (valid response times only)
+  filtered_response <- reactive({
+    filtered_data() %>%
+      filter(!is.na(response_time) & response_time > 0 & response_time < 720)
+  })
   
-  output$total_records <- renderValueBox({
+  # ============================================
+  # TAB 1: OVERVIEW OUTPUTS
+  # ============================================
+  
+  output$total_complaints <- renderValueBox({
     valueBox(
       format(nrow(filtered_data()), big.mark = ","),
-      "Total Records",
-      icon = icon("database"),
-      color = "aqua"
+      "Total Complaints",
+      icon = icon("phone"),
+      color = "blue"
     )
   })
   
-  output$avg_charge <- renderValueBox({
-    avg <- mean(filtered_data()$current_charges, na.rm = TRUE)
+  output$top_complaint <- renderValueBox({
+    top <- filtered_data() %>%
+      count(complaint_type, sort = TRUE) %>%
+      slice(1) %>%
+      pull(complaint_type)
+    
     valueBox(
-      paste0("$", format(round(avg, 2), big.mark = ",")),
-      "Average Charge",
-      icon = icon("dollar-sign"),
-      color = "yellow"
+      ifelse(length(top) > 0, top, "N/A"),
+      "Top Complaint Type",
+      icon = icon("exclamation-triangle"),
+      color = "orange"
     )
   })
   
-  output$total_boroughs <- renderValueBox({
+  output$avg_response <- renderValueBox({
+    avg_hrs <- filtered_response() %>%
+      pull(response_time) %>%
+      median(na.rm = TRUE)
+    
     valueBox(
-      length(unique(filtered_data()$borough)),
-      "Boroughs Selected",
-      icon = icon("map-marker-alt"),
-      color = "red"
-    )
-  })
-  
-  output$date_range <- renderValueBox({
-    dates <- range(filtered_data()$revenue_month, na.rm = TRUE)
-    valueBox(
-      paste(format(dates[1], "%Y"), "-", format(dates[2], "%Y")),
-      "Date Range",
-      icon = icon("calendar"),
+      ifelse(!is.na(avg_hrs), paste(round(avg_hrs, 1), "hrs"), "N/A"),
+      "Median Response Time",
+      icon = icon("clock"),
       color = "purple"
     )
   })
   
-  # ===========================================================================
-  # DATA EXPLORER
-  # ===========================================================================
-  
-  output$data_table <- renderDT({
-    filtered_data() %>%
-      select(borough, season, current_charges, consumption_kwh, revenue_month, 
-             development_name, funding_source) %>%
-      head(500) %>%
-      datatable(
-        options = list(
-          pageLength = 10,
-          scrollX = TRUE,
-          dom = 'frtip',
-          initComplete = JS(
-            "function(settings, json) {",
-            "$(this.api().table().header()).css({'background-color': '#1a1a2e', 'color': '#00d9c0'});",
-            "}"
-          )
+  output$map <- renderLeaflet({
+    map_data <- filtered_data() %>%
+      filter(!is.na(latitude) & !is.na(longitude)) %>%
+      head(1000)
+    
+    leaflet(map_data) %>%
+      addTiles() %>%
+      setView(lng = -73.95, lat = 40.75, zoom = 11) %>%
+      addMarkers(
+        ~longitude, ~latitude,
+        popup = ~paste(
+          "<b>Complaint Type:</b>", complaint_type, "<br>",
+          "<b>Borough:</b>", borough, "<br>",
+          "<b>Address:</b>", incident_address, "<br>",
+          "<b>Date:</b>", as.character(created_date), "<br>",
+          "<b>Status:</b>", status
         ),
-        class = 'cell-border stripe',
-        rownames = FALSE
-      ) %>%
-      formatCurrency(columns = c("current_charges"), currency = "$", digits = 2) %>%
-      formatRound(columns = c("consumption_kwh"), digits = 0)
+        clusterOptions = markerClusterOptions()
+      )
   })
   
-  output$borough_summary <- renderDT({
+  output$complaint_count_table <- renderDT({
     filtered_data() %>%
+      count(complaint_type, sort = TRUE) %>%
+      rename(`Complaint Type` = complaint_type, `Count` = n) %>%
+      head(15) %>%
+      datatable(
+        options = list(pageLength = 10, dom = 'tip'),
+        rownames = FALSE
+      )
+  })
+  
+  output$location_count_table <- renderDT({
+    filtered_data() %>%
+      filter(!is.na(incident_address) & incident_address != "") %>%
+      count(incident_address, borough, sort = TRUE) %>%
+      rename(Address = incident_address, Borough = borough, Count = n) %>%
+      head(15) %>%
+      datatable(
+        options = list(pageLength = 10, dom = 'tip'),
+        rownames = FALSE
+      )
+  })
+  
+  # ============================================
+  # TAB 2: BOROUGH ANALYSIS OUTPUTS
+  # ============================================
+  
+  output$borough_volume_plot <- renderPlotly({
+    borough_data <- filtered_data() %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      count(borough, sort = TRUE)
+    
+    plot_ly(borough_data, x = ~reorder(borough, -n), y = ~n, type = "bar",
+            marker = list(color = c("#8B5CF6", "#3B82F6", "#10B981", "#F59E0B", "#EF4444")),
+            text = ~format(n, big.mark = ","), textposition = "outside") %>%
+      layout(xaxis = list(title = ""),
+             yaxis = list(title = "Number of Complaints"),
+             showlegend = FALSE)
+  })
+  
+  output$borough_complaint_heatmap <- renderPlotly({
+    heatmap_data <- filtered_data() %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      count(borough, complaint_type) %>%
+      group_by(borough) %>%
+      slice_max(n, n = 5) %>%
+      ungroup()
+    
+    plot_ly(heatmap_data, x = ~borough, y = ~complaint_type, z = ~n,
+            type = "heatmap", colors = "Blues") %>%
+      layout(xaxis = list(title = ""),
+             yaxis = list(title = "", tickfont = list(size = 10)))
+  })
+  
+  output$borough_summary_table <- renderDT({
+    filtered_data() %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
       group_by(Borough = borough) %>%
       summarise(
-        N = n(),
-        `Mean ($)` = round(mean(current_charges, na.rm = TRUE), 2),
-        `SD ($)` = round(sd(current_charges, na.rm = TRUE), 2),
-        `Median ($)` = round(median(current_charges, na.rm = TRUE), 2)
+        `Total Complaints` = n(),
+        `Unique Complaint Types` = n_distinct(complaint_type),
+        `Top Complaint` = names(sort(table(complaint_type), decreasing = TRUE))[1],
+        `Avg Response (hrs)` = round(mean(response_time[response_time > 0 & response_time < 720], na.rm = TRUE), 1)
       ) %>%
-      datatable(
-        options = list(dom = 't', pageLength = 10),
-        rownames = FALSE
-      ) %>%
-      formatCurrency(columns = c("Mean ($)", "SD ($)", "Median ($)"), currency = "$")
+      arrange(desc(`Total Complaints`)) %>%
+      datatable(options = list(pageLength = 5, dom = 't'), rownames = FALSE)
   })
   
-  output$season_summary <- renderDT({
-    filtered_data() %>%
-      group_by(Season = season) %>%
-      summarise(
-        N = n(),
-        `Mean ($)` = round(mean(current_charges, na.rm = TRUE), 2),
-        `SD ($)` = round(sd(current_charges, na.rm = TRUE), 2),
-        `Median ($)` = round(median(current_charges, na.rm = TRUE), 2)
-      ) %>%
-      datatable(
-        options = list(dom = 't', pageLength = 10),
-        rownames = FALSE
-      ) %>%
-      formatCurrency(columns = c("Mean ($)", "SD ($)", "Median ($)"), currency = "$")
-  })
-  
-  # ===========================================================================
-  # VISUALIZATIONS
-  # ===========================================================================
-  
-  # Color palette
-  borough_colors <- c(
-    "BRONX" = "#e94560",
-    "BROOKLYN" = "#00d9c0", 
-    "MANHATTAN" = "#f5a623",
-    "QUEENS" = "#7b68ee",
-    "STATEN ISLAND" = "#ff6b9d"
-  )
-  
-  season_colors <- c(
-    "Winter" = "#64b5f6",
-    "Spring" = "#81c784",
-    "Summer" = "#ffb74d",
-    "Fall" = "#e57373"
-  )
-  
-  output$boxplot_borough <- renderPlotly({
-    p <- filtered_data() %>%
-      ggplot(aes(x = borough, y = current_charges, fill = borough)) +
-      geom_boxplot(outlier.shape = NA, alpha = 0.8) +
-      scale_fill_manual(values = borough_colors) +
-      coord_cartesian(ylim = quantile(filtered_data()$current_charges, c(0.05, 0.95), na.rm = TRUE)) +
-      labs(x = "", y = "Current Charges ($)") +
-      theme_minimal() +
-      theme(
-        legend.position = "none",
-        plot.background = element_rect(fill = "transparent", color = NA),
-        panel.background = element_rect(fill = "transparent", color = NA),
-        panel.grid.major = element_line(color = "rgba(255,255,255,0.1)"),
-        panel.grid.minor = element_blank(),
-        axis.text = element_text(color = "#eaeaea", size = 10),
-        axis.title = element_text(color = "#eaeaea", size = 12)
-      )
-    
-    ggplotly(p) %>%
-      layout(
-        paper_bgcolor = 'rgba(0,0,0,0)',
-        plot_bgcolor = 'rgba(0,0,0,0)',
-        font = list(color = '#eaeaea')
-      )
-  })
-  
-  output$barplot_borough <- renderPlotly({
-    borough_means <- filtered_data() %>%
+  output$borough_facet_plot <- renderPlotly({
+    facet_data <- filtered_data() %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      count(borough, complaint_type) %>%
       group_by(borough) %>%
-      summarise(mean_charges = mean(current_charges, na.rm = TRUE)) %>%
-      arrange(desc(mean_charges))
+      slice_max(n, n = 5) %>%
+      ungroup()
     
-    p <- ggplot(borough_means, aes(x = reorder(borough, mean_charges), 
-                                   y = mean_charges, fill = borough)) +
-      geom_bar(stat = "identity", alpha = 0.9) +
-      scale_fill_manual(values = borough_colors) +
+    p <- ggplot(facet_data, aes(x = reorder(complaint_type, n), y = n, fill = borough)) +
+      geom_col() +
       coord_flip() +
-      labs(x = "", y = "Mean Current Charges ($)") +
+      facet_wrap(~borough, scales = "free_y", ncol = 3) +
+      labs(x = "", y = "Count") +
       theme_minimal() +
-      theme(
-        legend.position = "none",
-        plot.background = element_rect(fill = "transparent", color = NA),
-        panel.background = element_rect(fill = "transparent", color = NA),
-        panel.grid.major = element_line(color = "rgba(255,255,255,0.1)"),
-        panel.grid.minor = element_blank(),
-        axis.text = element_text(color = "#eaeaea", size = 10),
-        axis.title = element_text(color = "#eaeaea", size = 12)
-      )
+      theme(legend.position = "none",
+            axis.text.y = element_text(size = 8))
     
-    ggplotly(p) %>%
-      layout(
-        paper_bgcolor = 'rgba(0,0,0,0)',
-        plot_bgcolor = 'rgba(0,0,0,0)',
-        font = list(color = '#eaeaea')
-      )
+    ggplotly(p, height = 500)
   })
   
-  output$barplot_season <- renderPlotly({
-    season_means <- filtered_data() %>%
-      group_by(season) %>%
-      summarise(mean_charges = mean(current_charges, na.rm = TRUE))
+  # ============================================
+  # TAB 3: COMPLAINT PATTERNS OUTPUTS
+  # ============================================
+  
+  output$top_complaints_plot <- renderPlotly({
+    complaint_data <- filtered_data() %>%
+      count(complaint_type, sort = TRUE) %>%
+      head(15)
     
-    p <- ggplot(season_means, aes(x = season, y = mean_charges, fill = season)) +
-      geom_bar(stat = "identity", alpha = 0.9) +
-      scale_fill_manual(values = season_colors) +
-      labs(x = "", y = "Mean Current Charges ($)") +
-      theme_minimal() +
-      theme(
-        legend.position = "none",
-        plot.background = element_rect(fill = "transparent", color = NA),
-        panel.background = element_rect(fill = "transparent", color = NA),
-        panel.grid.major = element_line(color = "rgba(255,255,255,0.1)"),
-        panel.grid.minor = element_blank(),
-        axis.text = element_text(color = "#eaeaea", size = 10),
-        axis.title = element_text(color = "#eaeaea", size = 12)
-      )
-    
-    ggplotly(p) %>%
-      layout(
-        paper_bgcolor = 'rgba(0,0,0,0)',
-        plot_bgcolor = 'rgba(0,0,0,0)',
-        font = list(color = '#eaeaea')
-      )
+    plot_ly(complaint_data, x = ~n, y = ~reorder(complaint_type, n), 
+            type = "bar", orientation = "h",
+            marker = list(color = "steelblue")) %>%
+      layout(yaxis = list(title = ""),
+             xaxis = list(title = "Number of Complaints"))
   })
   
-  output$interaction_plot <- renderPlotly({
-    interaction_data <- filtered_data() %>%
-      group_by(borough, season) %>%
-      summarise(mean_charges = mean(current_charges, na.rm = TRUE), .groups = 'drop')
+  output$complaint_pie <- renderPlotly({
+    pie_data <- filtered_data() %>%
+      count(complaint_type, sort = TRUE) %>%
+      head(8) %>%
+      mutate(complaint_type = ifelse(row_number() > 7, "Other", complaint_type))
     
-    p <- ggplot(interaction_data, aes(x = season, y = mean_charges, 
-                                      color = borough, group = borough)) +
-      geom_line(size = 1.2) +
-      geom_point(size = 3) +
-      scale_color_manual(values = borough_colors) +
-      labs(x = "", y = "Mean Current Charges ($)", color = "Borough") +
-      theme_minimal() +
-      theme(
-        plot.background = element_rect(fill = "transparent", color = NA),
-        panel.background = element_rect(fill = "transparent", color = NA),
-        panel.grid.major = element_line(color = "rgba(255,255,255,0.1)"),
-        panel.grid.minor = element_blank(),
-        axis.text = element_text(color = "#eaeaea", size = 10),
-        axis.title = element_text(color = "#eaeaea", size = 12),
-        legend.background = element_rect(fill = "transparent"),
-        legend.text = element_text(color = "#eaeaea"),
-        legend.title = element_text(color = "#eaeaea")
-      )
-    
-    ggplotly(p) %>%
-      layout(
-        paper_bgcolor = 'rgba(0,0,0,0)',
-        plot_bgcolor = 'rgba(0,0,0,0)',
-        font = list(color = '#eaeaea'),
-        legend = list(bgcolor = 'rgba(0,0,0,0)')
-      )
+    plot_ly(pie_data, labels = ~complaint_type, values = ~n, type = "pie",
+            textinfo = "percent", hoverinfo = "label+value") %>%
+      layout(showlegend = TRUE)
   })
   
-  output$heatmap <- renderPlotly({
+  output$complaint_borough_heatmap <- renderPlotly({
     heatmap_data <- filtered_data() %>%
-      group_by(borough, season) %>%
-      summarise(mean_charges = mean(current_charges, na.rm = TRUE), .groups = 'drop')
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      count(complaint_type, borough) %>%
+      filter(complaint_type %in% names(sort(table(filtered_data()$complaint_type), decreasing = TRUE)[1:15]))
     
-    p <- ggplot(heatmap_data, aes(x = season, y = borough, fill = mean_charges)) +
-      geom_tile(color = "white", size = 0.5) +
-      geom_text(aes(label = paste0("$", format(round(mean_charges, 0), big.mark = ","))),
-                color = "white", fontface = "bold", size = 4) +
-      scale_fill_gradient2(
-        low = "#00d9c0", 
-        mid = "#7b68ee", 
-        high = "#e94560",
-        midpoint = median(heatmap_data$mean_charges),
-        name = "Mean Charges ($)"
-      ) +
-      labs(x = "", y = "") +
-      theme_minimal() +
-      theme(
-        plot.background = element_rect(fill = "transparent", color = NA),
-        panel.background = element_rect(fill = "transparent", color = NA),
-        panel.grid = element_blank(),
-        axis.text = element_text(color = "#eaeaea", size = 12),
-        legend.background = element_rect(fill = "transparent"),
-        legend.text = element_text(color = "#eaeaea"),
-        legend.title = element_text(color = "#eaeaea")
-      )
+    plot_ly(heatmap_data, x = ~borough, y = ~complaint_type, z = ~n,
+            type = "heatmap", colors = "YlOrRd") %>%
+      layout(xaxis = list(title = ""),
+             yaxis = list(title = "", tickfont = list(size = 10)))
+  })
+  
+  output$complaint_stats_table <- renderDT({
+    filtered_data() %>%
+      count(complaint_type, sort = TRUE) %>%
+      head(20) %>%
+      mutate(
+        Percentage = paste0(round(n / sum(n) * 100, 1), "%"),
+        `Cumulative %` = paste0(round(cumsum(n) / sum(n) * 100, 1), "%")
+      ) %>%
+      rename(`Complaint Type` = complaint_type, Count = n) %>%
+      datatable(options = list(pageLength = 10), rownames = FALSE)
+  })
+  
+  # ============================================
+  # TAB 4: RESPONSE TIME ANALYSIS OUTPUTS
+  # ============================================
+  
+  output$median_response <- renderValueBox({
+    med <- filtered_response() %>%
+      pull(response_time) %>%
+      median(na.rm = TRUE)
     
-    ggplotly(p) %>%
-      layout(
-        paper_bgcolor = 'rgba(0,0,0,0)',
-        plot_bgcolor = 'rgba(0,0,0,0)',
-        font = list(color = '#eaeaea')
-      )
-  })
-  
-  # ===========================================================================
-  # ANOVA ANALYSIS
-  # ===========================================================================
-  
-  # Borough ANOVA
-  anova_borough <- reactive({
-    aov(current_charges ~ borough, data = filtered_data())
-  })
-  
-  output$anova_borough_output <- renderPrint({
-    summary(anova_borough())
-  })
-  
-  output$anova_borough_decision <- renderUI({
-    anova_summary <- summary(anova_borough())
-    p_value <- anova_summary[[1]]$`Pr(>F)`[1]
-    f_stat <- anova_summary[[1]]$`F value`[1]
-    
-    if (p_value < 0.05) {
-      div(class = "decision-box significant",
-          h4(icon("check-circle"), style = "color: #00d9c0;", " Decision: REJECT H₀"),
-          p(paste0("F-statistic: ", round(f_stat, 2))),
-          p(paste0("P-value: ", format(p_value, scientific = TRUE, digits = 4))),
-          p("Since p-value < 0.05, there is statistically significant evidence that mean 
-           current charges differ among NYC boroughs.")
-      )
-    } else {
-      div(class = "decision-box",
-          h4(icon("times-circle"), style = "color: #e94560;", " Decision: FAIL TO REJECT H₀"),
-          p(paste0("F-statistic: ", round(f_stat, 2))),
-          p(paste0("P-value: ", format(p_value, scientific = TRUE, digits = 4))),
-          p("Since p-value ≥ 0.05, there is insufficient evidence to conclude that mean 
-           current charges differ among NYC boroughs.")
-      )
-    }
-  })
-  
-  output$tukey_borough_output <- renderPrint({
-    TukeyHSD(anova_borough())
-  })
-  
-  # Season ANOVA
-  anova_season <- reactive({
-    aov(current_charges ~ season, data = filtered_data())
-  })
-  
-  output$anova_season_output <- renderPrint({
-    summary(anova_season())
-  })
-  
-  output$anova_season_decision <- renderUI({
-    anova_summary <- summary(anova_season())
-    p_value <- anova_summary[[1]]$`Pr(>F)`[1]
-    f_stat <- anova_summary[[1]]$`F value`[1]
-    
-    if (p_value < 0.05) {
-      div(class = "decision-box significant",
-          h4(icon("check-circle"), style = "color: #00d9c0;", " Decision: REJECT H₀"),
-          p(paste0("F-statistic: ", round(f_stat, 2))),
-          p(paste0("P-value: ", format(p_value, scientific = TRUE, digits = 4))),
-          p("Since p-value < 0.05, there is statistically significant evidence that mean 
-           current charges differ among seasons.")
-      )
-    } else {
-      div(class = "decision-box",
-          h4(icon("times-circle"), style = "color: #e94560;", " Decision: FAIL TO REJECT H₀"),
-          p(paste0("F-statistic: ", round(f_stat, 2))),
-          p(paste0("P-value: ", format(p_value, scientific = TRUE, digits = 4))),
-          p("Since p-value ≥ 0.05, there is insufficient evidence to conclude that mean 
-           current charges differ among seasons.")
-      )
-    }
-  })
-  
-  output$tukey_season_output <- renderPrint({
-    TukeyHSD(anova_season())
-  })
-  
-  # Two-Way ANOVA
-  anova_twoway <- reactive({
-    aov(current_charges ~ borough * season, data = filtered_data())
-  })
-  
-  output$anova_twoway_output <- renderPrint({
-    summary(anova_twoway())
-  })
-  
-  output$anova_twoway_decision <- renderUI({
-    anova_summary <- summary(anova_twoway())
-    
-    p_borough <- anova_summary[[1]]$`Pr(>F)`[1]
-    p_season <- anova_summary[[1]]$`Pr(>F)`[2]
-    p_interaction <- anova_summary[[1]]$`Pr(>F)`[3]
-    
-    div(
-      div(class = if(p_borough < 0.05) "decision-box significant" else "decision-box",
-          h4("1. Borough Main Effect"),
-          p(paste0("P-value: ", format(p_borough, scientific = TRUE, digits = 3))),
-          p(if(p_borough < 0.05) "✓ SIGNIFICANT - Borough affects charges" else "✗ Not significant")
-      ),
-      div(class = if(p_season < 0.05) "decision-box significant" else "decision-box",
-          h4("2. Season Main Effect"),
-          p(paste0("P-value: ", format(p_season, scientific = TRUE, digits = 3))),
-          p(if(p_season < 0.05) "✓ SIGNIFICANT - Season affects charges" else "✗ Not significant")
-      ),
-      div(class = if(p_interaction < 0.05) "decision-box significant" else "decision-box",
-          h4("3. Borough × Season Interaction"),
-          p(paste0("P-value: ", format(p_interaction, scientific = TRUE, digits = 3))),
-          p(if(p_interaction < 0.05) 
-            "✓ SIGNIFICANT - The effect of season depends on borough" 
-            else 
-              "✗ Not significant - Seasonal effect is consistent across boroughs")
-      )
+    valueBox(
+      paste(round(med, 1), "hrs"),
+      "Median Response Time",
+      icon = icon("clock"),
+      color = "blue"
     )
   })
   
-  # ===========================================================================
-  # REGRESSION
-  # ===========================================================================
-  
-  reg_model <- reactive({
-    lm(current_charges ~ borough + season, data = filtered_data())
-  })
-  
-  output$regression_output <- renderPrint({
-    summary(reg_model())
-  })
-  
-  output$conf_int_output <- renderPrint({
-    confint(reg_model())
-  })
-  
-  output$regression_interpretation <- renderUI({
-    reg_summary <- summary(reg_model())
-    r_sq <- round(reg_summary$r.squared, 4)
-    adj_r_sq <- round(reg_summary$adj.r.squared, 4)
+  output$pct_resolved_24h <- renderValueBox({
+    pct <- filtered_response() %>%
+      summarise(pct = mean(response_time <= 24, na.rm = TRUE) * 100) %>%
+      pull(pct)
     
-    div(class = "info-card",
-        h4(icon("chart-pie"), " R-Squared Interpretation"),
-        p(strong("R² = "), r_sq),
-        p(strong("Adjusted R² = "), adj_r_sq),
-        hr(),
-        p(paste0("Approximately ", round(r_sq * 100, 2), "% of the variance in current 
-               electricity charges is explained by borough and season combined.")),
-        p(style = "color: #f5a623;",
-          "Note: While statistically significant, this indicates that other factors 
-        (building size, consumption patterns, rate class) explain the majority of 
-        variation in electricity charges.")
+    valueBox(
+      paste0(round(pct, 1), "%"),
+      "Resolved Within 24 Hours",
+      icon = icon("check-circle"),
+      color = "green"
     )
   })
   
-  output$diagnostic_plots <- renderPlot({
-    par(mfrow = c(2, 2), bg = "transparent", fg = "#eaeaea", 
-        col.axis = "#eaeaea", col.lab = "#eaeaea", col.main = "#eaeaea")
-    plot(reg_model(), col = "#e94560", pch = 16)
-  }, bg = "transparent")
-  
-  output$effect_size_output <- renderPrint({
-    # Calculate eta-squared
-    anova_b <- summary(anova_borough())
-    anova_s <- summary(anova_season())
+  output$pct_resolved_week <- renderValueBox({
+    pct <- filtered_response() %>%
+      summarise(pct = mean(response_time <= 168, na.rm = TRUE) * 100) %>%
+      pull(pct)
     
-    ss_borough <- anova_b[[1]]$`Sum Sq`[1]
-    ss_total_borough <- sum(anova_b[[1]]$`Sum Sq`)
-    eta_sq_borough <- ss_borough / ss_total_borough
-    
-    ss_season <- anova_s[[1]]$`Sum Sq`[1]
-    ss_total_season <- sum(anova_s[[1]]$`Sum Sq`)
-    eta_sq_season <- ss_season / ss_total_season
-    
-    cat("ETA-SQUARED (η²) - Proportion of Variance Explained:\n")
-    cat("====================================================\n\n")
-    cat("Borough effect: η² =", round(eta_sq_borough, 4), 
-        "(", round(eta_sq_borough * 100, 2), "% of variance)\n")
-    cat("Season effect:  η² =", round(eta_sq_season, 4), 
-        "(", round(eta_sq_season * 100, 2), "% of variance)\n\n")
-    cat("Interpretation guidelines:\n")
-    cat("  Small effect:  η² ≈ 0.01\n")
-    cat("  Medium effect: η² ≈ 0.06\n")
-    cat("  Large effect:  η² ≈ 0.14\n")
+    valueBox(
+      paste0(round(pct, 1), "%"),
+      "Resolved Within 1 Week",
+      icon = icon("calendar-check"),
+      color = "purple"
+    )
   })
   
-  # ===========================================================================
-  # SUMMARY TABLE
-  # ===========================================================================
+  output$response_histogram <- renderPlotly({
+    hist_data <- filtered_response() %>%
+      filter(response_time <= 500)
+    
+    plot_ly(hist_data, x = ~response_time, type = "histogram", 
+            nbinsx = 50, marker = list(color = "steelblue")) %>%
+      layout(xaxis = list(title = "Response Time (Hours)"),
+             yaxis = list(title = "Frequency"))
+  })
   
-  output$summary_table <- renderDT({
-    anova_b <- summary(anova_borough())
-    anova_s <- summary(anova_season())
-    anova_tw <- summary(anova_twoway())
-    reg_sum <- summary(reg_model())
+  output$response_borough_box <- renderPlotly({
+    box_data <- filtered_response() %>%
+      filter(!is.na(borough) & borough != "Unspecified")
     
-    summary_df <- data.frame(
-      Test = c("One-Way ANOVA (Borough)", 
-               "One-Way ANOVA (Season)", 
-               "Two-Way ANOVA (Borough)", 
-               "Two-Way ANOVA (Season)",
-               "Two-Way ANOVA (Interaction)",
-               "Multiple Regression"),
-      `F Statistic` = c(
-        round(anova_b[[1]]$`F value`[1], 2),
-        round(anova_s[[1]]$`F value`[1], 2),
-        round(anova_tw[[1]]$`F value`[1], 2),
-        round(anova_tw[[1]]$`F value`[2], 2),
-        round(anova_tw[[1]]$`F value`[3], 2),
-        round(reg_sum$fstatistic[1], 2)
-      ),
-      `P Value` = c(
-        format(anova_b[[1]]$`Pr(>F)`[1], scientific = TRUE, digits = 3),
-        format(anova_s[[1]]$`Pr(>F)`[1], scientific = TRUE, digits = 3),
-        format(anova_tw[[1]]$`Pr(>F)`[1], scientific = TRUE, digits = 3),
-        format(anova_tw[[1]]$`Pr(>F)`[2], scientific = TRUE, digits = 3),
-        format(anova_tw[[1]]$`Pr(>F)`[3], scientific = TRUE, digits = 3),
-        "< 2.2e-16"
-      ),
-      Significant = c(
-        ifelse(anova_b[[1]]$`Pr(>F)`[1] < 0.05, "Yes ✓", "No"),
-        ifelse(anova_s[[1]]$`Pr(>F)`[1] < 0.05, "Yes ✓", "No"),
-        ifelse(anova_tw[[1]]$`Pr(>F)`[1] < 0.05, "Yes ✓", "No"),
-        ifelse(anova_tw[[1]]$`Pr(>F)`[2] < 0.05, "Yes ✓", "No"),
-        ifelse(anova_tw[[1]]$`Pr(>F)`[3] < 0.05, "Yes ✓", "No"),
-        "Yes ✓"
-      ),
-      check.names = FALSE
-    )
+    plot_ly(box_data, x = ~borough, y = ~response_time, type = "box",
+            color = ~borough) %>%
+      layout(xaxis = list(title = ""),
+             yaxis = list(title = "Response Time (Hours)", range = c(0, 200)),
+             showlegend = FALSE)
+  })
+  
+  output$response_complaint_plot <- renderPlotly({
+    response_complaint <- filtered_response() %>%
+      group_by(complaint_type) %>%
+      summarise(
+        avg_response = mean(response_time, na.rm = TRUE),
+        count = n()
+      ) %>%
+      filter(count >= 10) %>%
+      arrange(desc(avg_response)) %>%
+      head(15)
     
-    datatable(
-      summary_df,
-      options = list(
-        dom = 't',
-        pageLength = 10,
-        initComplete = JS(
-          "function(settings, json) {",
-          "$(this.api().table().header()).css({'background-color': '#1a1a2e', 'color': '#00d9c0'});",
-          "}"
-        )
-      ),
-      rownames = FALSE,
-      class = 'cell-border'
-    )
+    plot_ly(response_complaint, x = ~avg_response, y = ~reorder(complaint_type, avg_response),
+            type = "bar", orientation = "h",
+            marker = list(color = "#EF4444")) %>%
+      layout(xaxis = list(title = "Average Response Time (Hours)"),
+             yaxis = list(title = ""))
+  })
+  
+  output$response_borough_table <- renderDT({
+    filtered_response() %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      group_by(Borough = borough) %>%
+      summarise(
+        `Count` = n(),
+        `Mean (hrs)` = round(mean(response_time, na.rm = TRUE), 1),
+        `Median (hrs)` = round(median(response_time, na.rm = TRUE), 1),
+        `Std Dev` = round(sd(response_time, na.rm = TRUE), 1),
+        `% < 24hrs` = paste0(round(mean(response_time <= 24) * 100, 1), "%")
+      ) %>%
+      arrange(desc(`Mean (hrs)`)) %>%
+      datatable(options = list(pageLength = 5, dom = 't'), rownames = FALSE)
+  })
+  
+  output$response_complaint_table <- renderDT({
+    filtered_response() %>%
+      group_by(`Complaint Type` = complaint_type) %>%
+      summarise(
+        Count = n(),
+        `Mean (hrs)` = round(mean(response_time, na.rm = TRUE), 1),
+        `Median (hrs)` = round(median(response_time, na.rm = TRUE), 1)
+      ) %>%
+      filter(Count >= 10) %>%
+      arrange(desc(`Mean (hrs)`)) %>%
+      head(15) %>%
+      datatable(options = list(pageLength = 10, dom = 't'), rownames = FALSE)
+  })
+  
+  # ============================================
+  # TAB 5: WEATHER & DEMOGRAPHICS OUTPUTS
+  # ============================================
+  
+  # --- Weather Visualizations ---
+  
+  # Complaint Types by Temperature Range (Heatmap)
+  output$temp_complaint_heatmap <- renderPlotly({
+    temp_data <- filtered_data() %>%
+      filter(!is.na(temp_mean_f)) %>%
+      mutate(temp_range = cut(temp_mean_f, 
+                              breaks = c(0, 40, 55, 70, 85, 100),
+                              labels = c("<40°F", "40-55°F", "55-70°F", "70-85°F", ">85°F"))) %>%
+      filter(!is.na(temp_range)) %>%
+      filter(complaint_type %in% names(sort(table(filtered_data()$complaint_type), decreasing = TRUE)[1:10])) %>%
+      count(complaint_type, temp_range)
+    
+    plot_ly(temp_data, x = ~temp_range, y = ~complaint_type, z = ~n,
+            type = "heatmap", colors = "YlOrRd") %>%
+      layout(xaxis = list(title = "Temperature Range"),
+             yaxis = list(title = "", tickfont = list(size = 10)))
+  })
+  
+  # Daily Complaints vs Temperature (Scatter)
+  output$complaints_vs_temp <- renderPlotly({
+    daily_temp <- filtered_data() %>%
+      filter(!is.na(temp_mean_f)) %>%
+      group_by(date_only, temp_mean_f) %>%
+      summarise(complaints = n(), .groups = "drop")
+    
+    plot_ly(daily_temp, x = ~temp_mean_f, y = ~complaints, type = "scatter", mode = "markers",
+            marker = list(color = "steelblue", opacity = 0.5)) %>%
+      layout(xaxis = list(title = "Mean Temperature (°F)"),
+             yaxis = list(title = "Daily Complaints"))
+  })
+  
+  # Heating Complaints by Temperature Range (Bar)
+  output$heating_vs_temp <- renderPlotly({
+    heating_data <- filtered_data() %>%
+      filter(complaint_type == "HEAT/HOT WATER" & !is.na(temp_mean_f)) %>%
+      mutate(temp_range = cut(temp_mean_f, 
+                              breaks = c(0, 32, 45, 60, 75, 100),
+                              labels = c("<32°F", "32-45°F", "45-60°F", "60-75°F", ">75°F"))) %>%
+      filter(!is.na(temp_range)) %>%
+      count(temp_range)
+    
+    plot_ly(heating_data, x = ~temp_range, y = ~n, type = "bar",
+            marker = list(color = c("darkblue", "steelblue", "skyblue", "khaki", "orange"))) %>%
+      layout(xaxis = list(title = "Temperature Range"),
+             yaxis = list(title = "Number of Heating Complaints"))
+  })
+  
+  # Noise Complaints by Temperature Range (Bar)
+  output$noise_vs_temp <- renderPlotly({
+    noise_data <- filtered_data() %>%
+      filter(grepl("Noise", complaint_type, ignore.case = TRUE) & !is.na(temp_mean_f)) %>%
+      mutate(temp_range = cut(temp_mean_f, 
+                              breaks = c(0, 40, 55, 70, 85, 100),
+                              labels = c("<40°F", "40-55°F", "55-70°F", "70-85°F", ">85°F"))) %>%
+      filter(!is.na(temp_range)) %>%
+      count(temp_range)
+    
+    plot_ly(noise_data, x = ~temp_range, y = ~n, type = "bar",
+            marker = list(color = c("lightblue", "skyblue", "khaki", "orange", "red"))) %>%
+      layout(xaxis = list(title = "Temperature Range"),
+             yaxis = list(title = "Number of Noise Complaints"))
+  })
+  
+  # --- Demographics Visualizations ---
+  
+  # Housing Complaints vs Renter Percentage
+  output$housing_vs_renter <- renderPlotly({
+    housing_data <- filtered_data() %>%
+      filter(complaint_type %in% c("HEAT/HOT WATER", "PLUMBING", "WATER SYSTEM", "UNSANITARY CONDITION")) %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      group_by(borough, pct_renter, population) %>%
+      summarise(housing_complaints = n(), .groups = "drop") %>%
+      mutate(housing_per_1000 = housing_complaints / population * 1000)
+    
+    plot_ly(housing_data, x = ~pct_renter, y = ~housing_per_1000, 
+            type = "scatter", mode = "markers+text",
+            marker = list(size = 15, color = "orange"),
+            text = ~borough, textposition = "top center") %>%
+      layout(xaxis = list(title = "Percent Renter-Occupied Housing"),
+             yaxis = list(title = "Housing Complaints per 1,000 Residents"))
+  })
+  
+  # Complaints per Capita vs Median Income
+  output$complaints_vs_income <- renderPlotly({
+    income_data <- filtered_data() %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      group_by(borough, population, median_income) %>%
+      summarise(total_complaints = n(), .groups = "drop") %>%
+      mutate(complaints_per_1000 = total_complaints / population * 1000)
+    
+    plot_ly(income_data, x = ~median_income, y = ~complaints_per_1000, 
+            type = "scatter", mode = "markers+text",
+            marker = list(size = 15, color = "steelblue"),
+            text = ~borough, textposition = "top center") %>%
+      layout(xaxis = list(title = "Median Household Income ($)", tickformat = "$,.0f"),
+             yaxis = list(title = "Complaints per 1,000 Residents"))
+  })
+  
+  # Demographics Summary Table
+  output$demographics_table <- renderDT({
+    demo_summary <- filtered_data() %>%
+      filter(!is.na(borough) & borough != "Unspecified") %>%
+      group_by(Borough = borough) %>%
+      summarise(
+        `Total Complaints` = n(),
+        .groups = "drop"
+      ) %>%
+      left_join(nyc_demographics, by = c("Borough" = "borough")) %>%
+      mutate(
+        `Complaints per 1,000` = round(`Total Complaints` / population * 1000, 1),
+        `Median Income` = paste0("$", format(median_income, big.mark = ",")),
+        `% Renters` = paste0(round(pct_renter, 1), "%"),
+        `% Poverty` = paste0(round(pct_poverty, 1), "%")
+      ) %>%
+      select(Borough, `Total Complaints`, `Complaints per 1,000`, 
+             `Median Income`, `% Renters`, `% Poverty`)
+    
+    datatable(demo_summary, options = list(pageLength = 5, dom = 't'), rownames = FALSE)
   })
 }
 
-# =============================================================================
-# RUN THE APPLICATION
-# =============================================================================
-
-shinyApp(ui = ui, server = server)
+# ============================================
+# RUN APP
+# ============================================
+shinyApp(ui, server)
