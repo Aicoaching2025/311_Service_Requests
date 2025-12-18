@@ -15,7 +15,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 
 
-As a NYC resident and Data Science graduate student, I'm analyzing 311 service request data from 2010 to present to understand complaint patterns across our five boroughs. The 311 system is how we report non-emergency issues—from potholes and noise complaints to heat outages and street light repairs. By visualizing this data geographically, we can see where problems occur and how they cluster in specific neighborhoods. My  **primary hypothesis** is that  NYC 311 complaint patterns-including volume, type, and response times—are significantly influenced by weather conditions, neighborhood demographics, and borough characteristics.
+As a NYC resident and Data Science graduate student, I'm analyzing 311 service request data from 2010 to present to understand complaint patterns across our five boroughs. The 311 system is how we report non-emergency issues—from potholes and noise complaints to heat outages and street light repairs. By visualizing this data geographically, we can see where problems occur and how they cluster in specific neighborhoods. My  **primary hypothesis** is that  NYC 311 complaint patterns-including volume, type, and response times—are significantly influenced by neighborhood demographics, and borough characteristics.
 
 **How NYC Currently Uses 311 Data**
 
@@ -49,13 +49,13 @@ This project analyzes **NYC 311 service request data** to identify geographic co
 
 **Model:** Statistical and spatial analysis techniques will be applied to quantify complaint hotspots, measure temporal trends, and identify significant patterns across neighborhoods and time periods. Regression models will assess the influence of weather variables (temperature extremes, precipitation events) and demographic factors (population density, median income) on complaint frequency and type.
 
-**iNterpret:** My deliverable will be an interactive Shiny dashboard that allows users to filter by complaint type, date range, borough, weather conditions, and demographic characteristics. The dashboard will feature linked visualizations—an interactive map with complaint markers, dynamic time series charts, weather overlays, demographic profiles, and summary statistics—where selections on one view automatically update the others. Users can explore patterns, download custom reports, and identify areas needing proactive intervention based on environmental and socioeconomic context.
+**Interpret:** My deliverable will be an interactive Shiny dashboard that allows users to filter by complaint type, date range, borough, weather conditions, and demographic characteristics. The dashboard will feature linked visualizations—an interactive map with complaint markers, dynamic time series charts, weather overlays, demographic profiles, and summary statistics—where selections on one view automatically update the others. Users can explore patterns, download custom reports, and identify areas needing proactive intervention based on environmental and socioeconomic context.
 
 ---
 
 ## Obtain Data
 
-### Use API to gather NYC 311 data and place in a data frame called df_311
+### Obtain data from NYC Open Data via the Socrata REST AP
 
 ```{r}
 # Load required packages
@@ -118,7 +118,7 @@ sum(is.na(df_311$hour))
 df_311 %>% count(day_of_week)
 ```
 
-### Use API to gather weather data and left join weather data to the 311 data set (df_311)
+### Obtain data from Open-Meteo Historical Weather API
 
 ```{r}
 
@@ -174,7 +174,7 @@ cat("\nWeather columns added:", sum(!is.na(df_311$temp_mean_f)), "rows with weat
 
 ```
 
-### Use API to gather demographic data and left join demographic data to the 311 data set (df_311)
+### Obtain census data from the U.S. Census Bureau's American Community Survey via the tidycensus package
 
 ```{r}
 library(tidycensus)
@@ -237,14 +237,14 @@ head(df_311, 5)
 
 ## Scrub the Data
 
-### Scrub:Data set overview and Missing values analysis
+### Scrub:Data set overview and missing values analysis
 
 ```{r}
 library(dplyr)
 library(tidyr)
 library(lubridate)
 
-# 1. Dataset Overview
+# 1. DATASET OVERVIEW
 
 cat("Rows:", nrow(df_311), "\n")
 cat("Columns:", ncol(df_311), "\n")
@@ -272,13 +272,15 @@ print(missing_summary %>% filter(missing_pct > 0))
 ### Scrub: Drop columns with >30% of data missing
 
 ```{r}
-# Identify columns with >30% missing
+# Identify columns with >30% missing, BUT keep closed_date for response_time calc
 threshold <- 0.30
 cols_to_drop <- names(df_311)[colSums(is.na(df_311)) / nrow(df_311) > threshold]
 
+# Protect closed_date from being dropped
+cols_to_drop <- setdiff(cols_to_drop, "closed_date")
+
 cat("Dropping columns:", cols_to_drop, "\n")
 
-# Drop them
 df_311 <- df_311 %>%
   select(-all_of(cols_to_drop))
 ```
